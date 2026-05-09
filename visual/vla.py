@@ -296,7 +296,7 @@ def cmd_install_sdk(args):
 
     # 1. Base deps (same as brew venv — needed for mano-cua to run)
     print(f"  Installing base dependencies...")
-    result = subprocess.run(pip_cmd + ["install", "requests", "mss", "pynput", "customtkinter", "Pillow"], capture_output=True)
+    result = subprocess.run(pip_cmd + ["install", "requests", "mss", "pynput", "customtkinter", "Pillow", "huggingface_hub"], capture_output=True)
     if result.returncode != 0:
         print(f"  Base dependencies installation failed.")
         return 1
@@ -336,29 +336,41 @@ def cmd_install_sdk(args):
 
 def cmd_install_model(args):
     """Download model weights from HuggingFace"""
+    import subprocess
+
     model_name = args.name or "Mininglamp-2718/Mano-P"
-    print(f"Downloading model: {model_name}")
-    print("\nTip: If you already have model weights locally, skip this and set the path directly:")
-    print("     mano-cua config --set default-model-path /path/to/model\n")
-    try:
-        from huggingface_hub import snapshot_download
-        path = snapshot_download(model_name, allow_patterns="w8a16/*")
+    model_dir = os.path.expanduser("~/.mano/models/Mano-P")
 
-        import os
-        model_path = os.path.join(path, "w8a16") if os.path.isdir(os.path.join(path, "w8a16")) else path
-        print(f"Model downloaded to: {model_path}")
+    print(f"Downloading model: {model_name}\n")
+    print("Option 1: Download from webpage")
+    print(f"  https://huggingface.co/{model_name}/tree/main/w8a16")
+    print(f"  Download all files, then:")
+    print(f"  mano-cua config --set default-model-path /path/to/w8a16\n")
+    print("Option 2: Download via CLI (requires HuggingFace token)")
+    print("  1. Create a token at https://huggingface.co/settings/tokens ")
+    print("  2. Run: hf auth login")
+    print(f"  3. Downloading now...\n")
 
-        from visual.config.user_config import set_config
-        set_config("default-model-path", model_path)
-        set_config("model-installed", "true")
-        print(f"Config updated: default-model-path = {model_path}")
-        return 0
-    except ImportError:
-        print("Error: huggingface_hub not installed. pip install huggingface_hub")
+    result = subprocess.run(
+        ["hf", "download", model_name, "--include", "w8a16/*", "--local-dir", model_dir]
+    )
+    if result.returncode != 0:
+        print(f"\nDownload failed. Make sure you are logged in:")
+        print(f"  hf auth login")
+        print(f"  Then run: mano-cua install-model")
+        print(f"\nOr download manually and set path:")
+        print(f"  mano-cua config --set default-model-path /path/to/model")
         return 1
-    except Exception as e:
-        print(f"Download failed: {e}")
-        return 1
+
+    model_path = os.path.join(model_dir, "w8a16")
+    if not os.path.isdir(model_path):
+        model_path = model_dir
+
+    from visual.config.user_config import set_config
+    set_config("default-model-path", model_path)
+    set_config("model-installed", "true")
+    print(f"\nModel ready: {model_path}")
+    return 0
 
 
 def main():
