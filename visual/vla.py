@@ -88,7 +88,7 @@ def run_task(task: str, expected_result: str = None, minimize: bool = False,
         # Check if user has a custom Python environment with deps already installed
         from visual.config.user_config import get_config as _get_config
         python_path = _get_config("python-path")
-        if python_path and os.path.isfile(python_path) and os.path.realpath(python_path) != os.path.realpath(sys.executable):
+        if python_path and os.path.isfile(python_path) and os.path.abspath(python_path) != os.path.abspath(sys.executable):
             # Re-execute with the user's Python that has all deps
             src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             env = os.environ.copy()
