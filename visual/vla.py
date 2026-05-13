@@ -84,17 +84,6 @@ def run_task(task: str, expected_result: str = None, minimize: bool = False,
     from visual.config.visual_config import BASE_URL, AUTOMATION_CONFIG, API_HEADERS
     from visual.computer.computer_use_util import get_or_create_device_id
 
-    if local:
-        # Check if user has a custom Python environment with deps already installed
-        from visual.config.user_config import get_config as _get_config
-        python_path = _get_config("python-path")
-        if python_path and os.path.isfile(python_path) and os.path.abspath(python_path) != os.path.abspath(sys.executable):
-            # Re-execute with the user's Python that has all deps
-            src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            env = os.environ.copy()
-            env["PYTHONPATH"] = src_dir + ((":" + env.get("PYTHONPATH", "")) if env.get("PYTHONPATH") else "")
-            os.execve(python_path, [python_path, "-m", "visual.vla"] + sys.argv[1:], env)
-
     # Open app/URL before starting (both modes)
     if app:
         _open_app(app)

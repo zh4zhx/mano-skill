@@ -121,8 +121,18 @@ jobs:
               (venv/"src").install Dir["visual"]
               (bin/"mano-cua").write <<~SH
                 #!/bin/bash
-                export PYTHONPATH="#{venv}/src"
-                exec "#{venv}/bin/python3" "#{venv}/src/visual/vla.py" "$@"
+                SRC="#{venv}/src"
+                export PYTHONPATH="$SRC"
+                CUSTOM_PY=""
+                CFG="$HOME/.mano/config.json"
+                if [ -f "$CFG" ]; then
+                  CUSTOM_PY=$(python3 -c "import json; print(json.load(open('$CFG')).get('python-path',''))" 2>/dev/null)
+                fi
+                if [ -n "$CUSTOM_PY" ] && [ -f "$CUSTOM_PY" ]; then
+                  exec "$CUSTOM_PY" "$SRC/visual/vla.py" "$@"
+                else
+                  exec "#{venv}/bin/python3" "$SRC/visual/vla.py" "$@"
+                fi
               SH
             end
 
