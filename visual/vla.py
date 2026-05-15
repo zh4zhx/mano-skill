@@ -27,6 +27,7 @@ from visual.local_service import (
     LocalServiceError,
     build_local_service_url,
     delete_local_service_state,
+    describe_local_service_invalid_response,
     generate_local_service_token,
     get_local_service_connect_host,
     is_pid_alive,
@@ -345,7 +346,7 @@ def _local_service_request(method: str, path: str, payload: dict = None, timeout
     try:
         data = response.json()
     except ValueError as exc:
-        raise LocalServiceError("Local service returned an invalid response.") from exc
+        raise LocalServiceError(describe_local_service_invalid_response(response)) from exc
 
     if not response.ok or not data.get("ok", False):
         raise LocalServiceError(data.get("detail") or f"Local service request failed: HTTP {response.status_code}")

@@ -119,6 +119,23 @@ def build_local_service_url(path: str, state: Optional[Dict[str, Any]] = None) -
     return f"http://{host}:{port}{normalized}"
 
 
+def describe_local_service_invalid_response(response: Any) -> str:
+    content_type = response.headers.get("Content-Type", "(missing)")
+    body = (getattr(response, "text", "") or "").strip()
+    snippet = " ".join(body.split())
+    if len(snippet) > 200:
+        snippet = snippet[:197] + "..."
+
+    message = (
+        f"Local service returned an invalid response (HTTP {response.status_code}, "
+        f"Content-Type: {content_type})."
+    )
+    if snippet:
+        message += f" Response starts with: {snippet!r}."
+    message += " Make sure the target host/port points to a compatible mano-cua local service."
+    return message
+
+
 def _normalize_model_path(model_path: str) -> str:
     return os.path.abspath(os.path.expanduser(model_path))
 

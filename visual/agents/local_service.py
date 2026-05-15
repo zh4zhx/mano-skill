@@ -7,6 +7,7 @@ from visual.agents.base import BaseAgent
 from visual.local_service import (
     LocalServiceError,
     build_local_service_url,
+    describe_local_service_invalid_response,
     load_local_service_state,
     make_local_service_headers,
     make_local_service_state,
@@ -68,7 +69,7 @@ class LocalServiceAgent(BaseAgent):
         try:
             data = response.json()
         except ValueError as exc:
-            raise LocalServiceError("Local service returned an invalid response.") from exc
+            raise LocalServiceError(describe_local_service_invalid_response(response)) from exc
 
         if not response.ok or not data.get("ok", False):
             detail = data.get("detail") or f"Local service request failed: HTTP {response.status_code}"
