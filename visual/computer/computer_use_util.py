@@ -1,6 +1,10 @@
 import base64
+import json
 import os
+import re
 import uuid
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import mss
@@ -56,3 +60,40 @@ def get_or_create_device_id():
     with open(device_file, "w") as f:
         f.write(device_id)
     return device_id
+
+
+def write_index_json(session_dir: Path, payload: Dict[str, Any]):
+    """Write screenshot cache index.json under the session directory."""
+    session_dir.mkdir(parents=True, exist_ok=True)
+    index_path = session_dir / "index.json"
+    index_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def ensure_directory(path: Path) -> Path:
+    """Create a directory if needed and return it."""
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def write_png(path: Path, png_bytes: bytes):
+    """Write PNG bytes to disk."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(png_bytes)
+
+
+def sanitize_filename_suffix(text: Optional[str], default: str = "screenshot") -> str:
+    """Convert free-form text into a short, filesystem-friendly suffix."""
+    candidate = (text or "").strip().lower()
+    candidate = re.sub(r"[^a-z0-9]+", "-", candidate)
+    candidate = re.sub(r"-{2,}", "-", candidate).strip("-")
+    if not candidate:
+        candidate = default
+    return candidate[:80].rstrip("-")
+
+
+def current_timestamp_iso() -> str:
+    """Return the current local timestamp in ISO-8601 format."""
+    return datetime.now().astimezone().isoformat(timespec="seconds")

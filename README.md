@@ -39,6 +39,12 @@ brew upgrade Mininglamp-AI/tap/mano-cua
 
 Download the latest `mano-cua-windows.zip` from [GitHub Releases](https://github.com/Mininglamp-AI/mano-skill/releases), extract it, and add the folder to your `PATH`.
 
+**From source on macOS:**
+
+```bash
+./install.sh
+```
+
 ## Usage
 
 ```bash
@@ -46,16 +52,29 @@ Download the latest `mano-cua-windows.zip` from [GitHub Releases](https://github
 mano-cua run "your task description"
 
 # Run with options (minimize UI panel and set max steps)
-mano-cua run "task" --minimize --max-steps 10
+mano-cua run --minimize --max-steps 10 "task"
 
 # Open a URL in the browser before starting the task
-mano-cua run "task" --url "https://example.com"
+mano-cua run --url "https://example.com" "task"
 
 # Open an app before starting the task
-mano-cua run "task" --app "Notes"
+mano-cua run --app "Notes" "task"
+
+# Start the persistent local inference service
+mano-cua local start
+
+# Start the service for LAN access
+mano-cua local start --host 0.0.0.0
+
+# Check or stop the persistent local inference service
+mano-cua local status
+mano-cua local stop
 
 # Run in local mode (on-device inference, macOS Apple Silicon only)
-mano-cua run "task" --local
+mano-cua run --local "task"
+
+# Persist task screenshots for debugging
+mano-cua run --screenshot-cache-dir /tmp/mano-cua-cache "task"
 
 # Stop the current running task
 mano-cua stop
@@ -72,33 +91,69 @@ Runs [Mano-P](https://huggingface.co/Mininglamp-2718/Mano-P) entirely on-device 
 mano-cua check
 mano-cua install-sdk
 mano-cua install-model
+mano-cua local start
+
+# Optional: allow other devices on your LAN to reach the local service
+mano-cua local start --host 0.0.0.0
 
 # Run
-mano-cua run "click the search box, type openai, click search" --local --url "https://www.google.com"
+mano-cua run --local --url "https://www.google.com" "click the search box, type openai, click search"
 ```
 
 ## Examples
 
 ```bash
 # Local mode (all inference on-device, no data leaves the machine)
-mano-cua run "click the search box, type openai, click search, click the first result" --local --url "https://www.google.com" --minimize
-mano-cua run "create a new note and type hello world" --local --app "Notes"
+mano-cua local start
+mano-cua run --local --url "https://www.google.com" --minimize "click the search box, type openai, click search, click the first result"
+mano-cua run --local --app "Notes" "create a new note and type hello world"
+
+# Local mode service reachable from your LAN
+mano-cua local start --host 0.0.0.0
+mano-cua local status
+
+# Run GUI automation on this machine, but use a remote local model service on your LAN
+mano-cua run --local \
+  --local-service-host 192.168.1.20 \
+  --local-service-token YOUR_PASSPHRASE \
+  "Open Notes and create a new note"
 
 # Cloud mode
 mano-cua run "Open Notes and create a new note titled Meeting Summary"
-mano-cua run "Search for AI news in the browser and show the first result" --minimize --max-steps 20
+mano-cua run --minimize --max-steps 20 "Search for AI news in the browser and show the first result"
 
 # Cloud mode with --app or --url
-mano-cua run "Create a calendar event for Friday 20:00 named Team Meeting" --app "Microsoft Outlook"
-mano-cua run "Compare available plans for the AeroAPI" --url "https://www.flightaware.com/"
+mano-cua run --app "Microsoft Outlook" "Create a calendar event for Friday 20:00 named Team Meeting"
+mano-cua run --url "https://www.flightaware.com/" "Compare available plans for the AeroAPI"
+
+# Expected-result validation and screenshot cache
+mano-cua run --expected-result "Bluetooth settings page is visible" "Open System Settings and go to Bluetooth"
+mano-cua run --screenshot-cache-dir /tmp/mano-cua-cache "Open System Settings and go to Bluetooth"
+
+# More examples
+mano-cua run "Open WeChat and tell FTY that the meeting is postponed"
+mano-cua run "Search for AI news in Xiaohongshu and show the first post"
 
 # Stop the current task
 mano-cua stop
+
+# Stop the persistent local inference service
+mano-cua local stop
 ```
+
+`run --local` now requires the local inference service to be running first. If it is not running, the CLI will ask you to start it with `mano-cua local start`.
+
+To expose the service to other devices on your local network, start it with `mano-cua local start --host 0.0.0.0`. The CLI keeps local requests on `127.0.0.1`, and `mano-cua local status` will show both the bind host and the local access address.
+
+To expose the service with your own memorable passphrase instead of a generated token, start it with `mano-cua local start --token your-passphrase` (you can combine this with `--host 0.0.0.0`).
+
+Requests from the same machine over `127.0.0.1` or `::1` do not need a token. Requests from other devices on the LAN still require the configured token/passphrase.
+
+To run automation on one machine while using a model service hosted on another machine in the same LAN, use `run --local` with `--local-service-host`, optional `--local-service-port`, and `--local-service-token`. The value passed to `--local-service-token` can be either the generated token or your custom passphrase. The remote host should be the LAN IP of the machine running `mano-cua local start --host 0.0.0.0`.
 
 ## Supported Actions
 
-click · type · hotkey · scroll · drag · mouse move · screenshot · wait · app launch
+click · type · hotkey · scroll · drag · mouse move · screenshot · wait · app launch · URL open
 
 ## Permissions
 
@@ -107,6 +162,22 @@ Screen Recording and Accessibility (Keyboard/Mouse control) permissions are requ
 ## Status Panel
 
 A small UI panel is displayed on the top-right corner of the screen to track and manage the current session status.
+
+## Debugging
+
+Use `--screenshot-cache-dir` to persist the task-start screenshot, the last screenshot of each step, and the task-end screenshot together with an `index.json` timeline. This is useful for replaying failures and inspecting what the model saw at each step.
+
+## macOS Utility
+
+`mac_silent_install.py` can silently install `.dmg` and `.pkg` payloads before handing control back to `mano-cua`.
+
+```bash
+python3 mac_silent_install.py \
+  --install-package-path "/tmp/demo.dmg" \
+  --app-path "/Applications/Demo.app" \
+  --udid "demo-local" \
+  --verbose
+```
 
 ## Safety & Consent
 

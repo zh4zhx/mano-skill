@@ -14,6 +14,7 @@ class BaseAgent(ABC):
         self,
         task_instruction: str,
         tool_results: Optional[List[Dict[str, Any]]] = None,
+        expected_result: Optional[str] = None,
     ) -> Tuple[str, List[Dict[str, Any]], str, str]:
         """Run one prediction step.
 

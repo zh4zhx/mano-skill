@@ -5,6 +5,7 @@ import platform
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Optional, Callable, Dict, Any, List
 
 from visual.agents.base import BaseAgent
@@ -16,7 +17,7 @@ from visual.config.visual_config import AUTOMATION_CONFIG, TASK_STATUS
 from visual.model.task_progress import TaskProgress
 from visual.model.task_state import TaskState
 from visual.computer.computer_use_util import screenshot_to_bytes, get_or_create_device_id, \
-    make_tool_result
+    make_tool_result, current_timestamp_iso, ensure_directory, sanitize_filename_suffix, write_index_json, write_png
 
 
 class TaskModel:
@@ -39,6 +40,12 @@ class TaskModel:
         self.expected_result = None
         self.max_steps = None
         self.eval_result = None
+        self.screenshot_cache_dir: Optional[str] = None
+        self._screenshot_cache_session_dir: Optional[Path] = None
+        self._screenshot_cache_entries: List[Dict[str, Any]] = []
+        self._screenshot_cache_seq = 0
+        self._screenshot_cache_disabled = False
+        self._screenshot_cache_session_key: Optional[str] = None
 
         # Trajectory saving
         self._save_trajectory = False
@@ -56,7 +63,14 @@ class TaskModel:
             self._on_state_changed(self.state)
 
     # ========== Initialization Methods ==========
-    def init_task(self, task_name: str, agent: BaseAgent, expected_result: Optional[str] = None, max_steps: int = None):
+    def init_task(
+        self,
+        task_name: str,
+        agent: BaseAgent,
+        expected_result: Optional[str] = None,
+        max_steps: int = None,
+        screenshot_cache_dir: Optional[str] = None,
+    ):
         """Initialize automation task"""
         # Basic configuration
         self.state.task_name = task_name
@@ -67,9 +81,11 @@ class TaskModel:
         self.state.is_running = True
         self.state.error_msg = None
         self.state.step_idx = 0
+        self._reset_screenshot_cache(screenshot_cache_dir)
 
         # Device and platform information
-        self.state.device_id = get_or_create_device_id()
+        self.state.session_id = getattr(agent, "session_id", None)
+        self.state.device_id = getattr(agent, "device_id", None) or get_or_create_device_id()
         self.state.platform_tag = platform.system()
 
         # Trajectory saving
@@ -106,6 +122,147 @@ class TaskModel:
 
         # Notify state change
         self._notify_state_changed()
+
+    def _reset_screenshot_cache(self, screenshot_cache_dir: Optional[str]):
+        """Reset screenshot cache state for a new task run."""
+        self.screenshot_cache_dir = screenshot_cache_dir
+        self._screenshot_cache_session_dir = None
+        self._screenshot_cache_entries = []
+        self._screenshot_cache_seq = 0
+        self._screenshot_cache_disabled = False
+        self._screenshot_cache_session_key = None
+
+    def _disable_screenshot_cache(self, error: Exception):
+        """Disable cache writes after a filesystem failure."""
+        if not self._screenshot_cache_disabled:
+            print(f"Screenshot cache disabled: {error}")
+        self._screenshot_cache_disabled = True
+        self.screenshot_cache_dir = None
+        self._screenshot_cache_session_dir = None
+
+    def _get_screenshot_cache_session_key(self) -> str:
+        """Return a stable cache key for the current task run."""
+        if self.state.session_id:
+            return self.state.session_id
+        if self._screenshot_cache_session_key:
+            return self._screenshot_cache_session_key
+        self._screenshot_cache_session_key = f"local-{uuid.uuid4().hex[:12]}"
+        return self._screenshot_cache_session_key
+
+    def _ensure_screenshot_cache_session_dir(self) -> Optional[Path]:
+        """Return the cache session directory when caching is enabled."""
+        if not self.screenshot_cache_dir or self._screenshot_cache_disabled:
+            return None
+        if self._screenshot_cache_session_dir:
+            return self._screenshot_cache_session_dir
+
+        session_key = self._get_screenshot_cache_session_key()
+        try:
+            session_dir = ensure_directory(Path(self.screenshot_cache_dir).expanduser() / session_key)
+        except Exception as error:
+            self._disable_screenshot_cache(error)
+            return None
+
+        self._screenshot_cache_session_dir = session_dir
+        return session_dir
+
+    def _build_screenshot_cache_filename(
+        self,
+        seq: int,
+        phase: str,
+        step_idx: Optional[int] = None,
+        action_desc: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> str:
+        """Build a stable screenshot cache filename."""
+        prefix = f"{seq:03d}"
+        if phase == "task_start":
+            return f"{prefix}_task-start.png"
+        if phase == "task_end":
+            status_suffix = sanitize_filename_suffix(status, default="unknown")
+            return f"{prefix}_task-end_{status_suffix}.png"
+        step_value = 0 if step_idx is None else step_idx
+        action_suffix = sanitize_filename_suffix(action_desc, default="screenshot")
+        return f"{prefix}_step-{step_value:02d}_{action_suffix}.png"
+
+    def _build_screenshot_cache_index(self) -> Dict[str, Any]:
+        """Build the screenshot cache index payload."""
+        return {
+            "session_id": self.state.session_id,
+            "task": self.state.task_name,
+            "entries": self._screenshot_cache_entries,
+        }
+
+    def _record_cached_screenshot(
+        self,
+        png_bytes: Optional[bytes],
+        phase: str,
+        step_idx: Optional[int] = None,
+        action_desc: Optional[str] = None,
+        reasoning: Optional[str] = None,
+        status: Optional[str] = None,
+    ):
+        """Persist a screenshot plus its metadata when caching is enabled."""
+        if not png_bytes:
+            return
+
+        session_dir = self._ensure_screenshot_cache_session_dir()
+        if not session_dir:
+            return
+
+        normalized_status = (status or self.state.status or "").lower() or None
+        file_name = self._build_screenshot_cache_filename(
+            self._screenshot_cache_seq,
+            phase=phase,
+            step_idx=step_idx,
+            action_desc=action_desc,
+            status=normalized_status,
+        )
+        screenshot_path = session_dir / file_name
+
+        entry = {
+            "seq": self._screenshot_cache_seq,
+            "phase": phase,
+            "step_idx": step_idx,
+            "status": normalized_status,
+            "action_desc": action_desc,
+            "reasoning": reasoning,
+            "timestamp": current_timestamp_iso(),
+            "screenshot_path": file_name,
+        }
+
+        try:
+            write_png(screenshot_path, png_bytes)
+            self._screenshot_cache_entries.append(entry)
+            write_index_json(session_dir, self._build_screenshot_cache_index())
+            self._screenshot_cache_seq += 1
+        except Exception as error:
+            self._disable_screenshot_cache(error)
+
+    def _capture_task_start_screenshot(self):
+        """Capture and cache the task-start screenshot."""
+        if not self.screenshot_cache_dir or self._screenshot_cache_disabled:
+            return
+        try:
+            self._record_cached_screenshot(screenshot_to_bytes(), phase="task_start")
+        except Exception as error:
+            self._disable_screenshot_cache(error)
+
+    def _capture_task_end_screenshot(self):
+        """Capture and cache the task-end screenshot."""
+        if not self.screenshot_cache_dir or self._screenshot_cache_disabled:
+            return
+        try:
+            self._record_cached_screenshot(
+                screenshot_to_bytes(),
+                phase="task_end",
+                step_idx=self.state.progress.step_idx,
+                action_desc=self.state.progress.action,
+                reasoning=self.state.progress.reasoning,
+                status=self.state.status,
+            )
+        except Exception as error:
+            self._disable_screenshot_cache(error)
 
     # ========== Progress Update ==========
     def update_progress(self, step_idx: int, action_desc: str, reasoning: str = "", meta: Dict[str, Any] = None):
@@ -217,6 +374,7 @@ class TaskModel:
         print(f"Expected result: {self.expected_result}")
 
         try:
+            self._capture_task_start_screenshot()
             self.update_progress(0, "Initializing", "Initializing session connection")
 
             # Execute task step loop
@@ -226,6 +384,7 @@ class TaskModel:
             if self.state.status == TASK_STATUS["MAX_STEP_REACHED"]:
                 self.state.is_running = False
                 self.stop_event.set()
+                self._save_final_trajectory()
                 self._print_summary("MAX_STEP_REACHED")
                 self._notify_state_changed()
                 skip = not (self.expected_result and self.agent.agent_type == "cloud")
@@ -247,6 +406,8 @@ class TaskModel:
 
         except Exception as e:
             self.mark_error(f"Task execution failed: {str(e)}")
+        finally:
+            self._capture_task_end_screenshot()
         # Close session for error/stopped/fail cases
         skip = not (self.expected_result and self.agent.agent_type == "cloud")
         self.eval_result = self.agent.close(skip_eval=skip)
@@ -268,6 +429,7 @@ class TaskModel:
                 reasoning, actions, status, action_desc = self.agent.predict(
                     task_instruction=self.state.task_name,
                     tool_results=tool_results,
+                    expected_result=self.expected_result,
                 )
             except Exception as e:
                 raise RuntimeError(f"Request step failed: {e}")
@@ -317,6 +479,15 @@ class TaskModel:
                 # Build tool result
                 include_screenshot = (i == len(actions) - 1)
                 after_shot = screenshot_to_bytes() if include_screenshot else None
+                if include_screenshot:
+                    self._record_cached_screenshot(
+                        after_shot,
+                        phase="step",
+                        step_idx=step_idx,
+                        action_desc=action_desc,
+                        reasoning=reasoning,
+                        status=self.state.status,
+                    )
 
                 tool_results.append(
                     make_tool_result(

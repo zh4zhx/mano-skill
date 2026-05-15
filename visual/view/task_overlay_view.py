@@ -303,6 +303,20 @@ class TaskOverlayView:
             self.root.geometry(f"{WINDOW_CONFIG['WIDTH']}x{WINDOW_CONFIG['MIN_HEIGHT']}+{x}+{y}")
             self.root.after(ANIMATION_CONFIG["HEIGHT_ADJUST_DELAY"], self._safe_adjust_window_height)
 
+    def minimize_and_restore_focus(self):
+        """Minimize immediately and restore focus to the app that was frontmost before the overlay."""
+        if not self._ui_initialized or not self.root:
+            return
+
+        if not self._minimized:
+            self._toggle_minimize()
+
+        if self._previous_app:
+            try:
+                self._previous_app.activateWithOptions_(0)
+            except Exception:
+                pass
+
     def _setup_dragging(self):
         """Window dragging functionality"""
         if not self.root:

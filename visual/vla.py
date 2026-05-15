@@ -17,6 +17,26 @@ import subprocess
 import time
 import requests
 
+if __package__ in (None, ""):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from visual.local_service import (
+    LOCAL_SERVICE_DEFAULT_PORT,
+    LOCAL_SERVICE_HOST,
+    LocalInferenceService,
+    LocalServiceError,
+    build_local_service_url,
+    delete_local_service_state,
+    generate_local_service_token,
+    get_local_service_connect_host,
+    is_pid_alive,
+    is_port_listening,
+    load_local_service_state,
+    make_local_service_headers,
+    make_local_service_state,
+    validate_local_service_token,
+)
+
 
 def stop_session():
     """Stop the current active session for this device"""
@@ -79,11 +99,41 @@ def _open_app(app_name: str):
 
 def run_task(task: str, expected_result: str = None, minimize: bool = False,
              max_steps: int = None, local: bool = False, model_path: str = None,
-             url: str = None, app: str = None):
+             url: str = None, app: str = None, screenshot_cache_dir: str = None,
+             local_service_host: str = None, local_service_port: int = None,
+             local_service_token: str = None):
     """Run an automation task"""
     from visual.config.visual_config import BASE_URL, AUTOMATION_CONFIG, API_HEADERS
     from visual.computer.computer_use_util import get_or_create_device_id
 
+    if local:
+        from visual.config.user_config import get_config
+        resolved_path = model_path or get_config("default-model-path")
+        if not resolved_path:
+            print("Error: No model path specified. Use --model-path or run:")
+            print("  mano-cua config --set default-model-path ~/path/to/model")
+            return 1
+        resolved_path = os.path.abspath(os.path.expanduser(resolved_path))
+        remote_service_state = None
+        if local_service_host:
+            if not local_service_token:
+                print("Error: --local-service-token is required when --local-service-host is set.")
+                return 1
+            remote_service_state = make_local_service_state(
+                host=local_service_host,
+                port=local_service_port or LOCAL_SERVICE_DEFAULT_PORT,
+                token=local_service_token,
+                use_connect_host=False,
+            )
+        try:
+            service_state = ensure_local_service_ready(
+                requested_model_path=resolved_path,
+                service_state=remote_service_state,
+                require_matching_model_path=not bool(remote_service_state),
+            )
+        except LocalServiceError as exc:
+            print(f"Error: {exc}")
+            return 1
     # Open app/URL before starting (both modes)
     if app:
         _open_app(app)
@@ -91,24 +141,17 @@ def run_task(task: str, expected_result: str = None, minimize: bool = False,
         _open_url_in_browser(url)
 
     if local:
-        # --- Local mode ---
         try:
-            from visual.agents.local import LocalAgent
-        except ImportError as e:
-            print(f"Error: Local mode dependencies not available: {e}")
-            print("Run: mano-cua install-sdk")
+            from visual.agents.local_service import LocalServiceAgent
+            agent = LocalServiceAgent(
+                task_instruction=task,
+                expected_result=expected_result,
+                requested_model_path=resolved_path,
+                service_state=service_state,
+            )
+        except Exception as e:
+            print(f"Error: {e}")
             return 1
-
-        resolved_path = model_path
-        if not resolved_path:
-            from visual.config.user_config import get_config
-            resolved_path = get_config("default-model-path")
-        if not resolved_path:
-            print("Error: No model path specified. Use --model-path or run:")
-            print("  mano-cua config --set default-model-path ~/path/to/model")
-            return 1
-
-        agent = LocalAgent(model_path=resolved_path)
     else:
         # --- Cloud mode (default, existing behavior) ---
         device_id = get_or_create_device_id()
@@ -150,16 +193,28 @@ def run_task(task: str, expected_result: str = None, minimize: bool = False,
 
     view_model = TaskViewModel()
 
-    # Start minimized if requested
-    if minimize and view_model.view and view_model.view._ui_initialized:
-        view_model.view.root.after(200, view_model.view._toggle_minimize)
-
-    if not view_model.init_task(task, agent, expected_result=expected_result, max_steps=max_steps):
+    if not view_model.init_task(
+        task,
+        agent,
+        expected_result=expected_result,
+        max_steps=max_steps,
+        screenshot_cache_dir=screenshot_cache_dir,
+    ):
         print("Failed to initialize visualization overlay.")
         # Run task directly without UI
-        view_model.model.init_task(task, agent, expected_result=expected_result, max_steps=max_steps)
+        view_model.model.init_task(
+            task,
+            agent,
+            expected_result=expected_result,
+            max_steps=max_steps,
+            screenshot_cache_dir=screenshot_cache_dir,
+        )
         view_model.model.run_automation_task()
         return 0 if view_model.model.state.status == "completed" else 1
+
+    # Start minimized before the task thread begins so the first shortcut reaches the target app.
+    if minimize and view_model.view and view_model.view._ui_initialized:
+        view_model.view.minimize_and_restore_focus()
 
     # Run task
     success = view_model.run_task()
@@ -219,6 +274,270 @@ def cmd_config(args):
 
     print("Usage: mano-cua config [--list | --get KEY | --set KEY VALUE]")
     return 1
+
+
+def _load_running_local_service_state(service_state: dict = None) -> dict:
+    state = service_state or load_local_service_state()
+    if not state:
+        raise LocalServiceError("Local service is not running. Start it with: mano-cua local start")
+
+    pid = state.get("pid")
+    host = state.get("connect_host") or get_local_service_connect_host(state.get("host"))
+    port = int(state.get("port") or LOCAL_SERVICE_DEFAULT_PORT)
+
+    if pid and not is_pid_alive(pid):
+        delete_local_service_state()
+        raise LocalServiceError("Local service is not running. Start it with: mano-cua local start")
+    if not is_port_listening(host, port):
+        if pid:
+            delete_local_service_state()
+        raise LocalServiceError("Local service is not running. Start it with: mano-cua local start")
+    return state
+
+
+def _local_service_request(method: str, path: str, payload: dict = None, timeout: int = 30, service_state: dict = None) -> dict:
+    state = _load_running_local_service_state(service_state=service_state)
+    headers = make_local_service_headers(state.get("token"))
+    url = build_local_service_url(path, state)
+
+    try:
+        response = requests.request(
+            method=method,
+            url=url,
+            json=payload or {},
+            headers=headers,
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        raise LocalServiceError("Local service is unavailable. Restart it with: mano-cua local stop && mano-cua local start") from exc
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise LocalServiceError("Local service returned an invalid response.") from exc
+
+    if not response.ok or not data.get("ok", False):
+        raise LocalServiceError(data.get("detail") or f"Local service request failed: HTTP {response.status_code}")
+    return data
+
+
+def ensure_local_service_ready(requested_model_path: str, service_state: dict = None, require_matching_model_path: bool = True) -> dict:
+    state = _load_running_local_service_state(service_state=service_state)
+    normalized_requested = os.path.abspath(os.path.expanduser(requested_model_path))
+
+    data = _local_service_request("GET", "/v1/local/status", timeout=10, service_state=state)
+    service_model_path = os.path.abspath(os.path.expanduser(data.get("model_path") or state.get("model_path") or ""))
+    if require_matching_model_path and service_model_path != normalized_requested:
+        raise LocalServiceError(
+            f"Local service is running with model '{service_model_path}'. Stop it and restart with '{normalized_requested}'."
+        )
+    if not data.get("ready"):
+        raise LocalServiceError("Local service is not ready yet. Wait for model loading to finish or restart it.")
+    merged = dict(state)
+    merged.update(data)
+    return merged
+
+
+def _resolve_local_service_python() -> str:
+    from visual.config.user_config import get_config
+
+    python_path = get_config("python-path")
+    if python_path and os.path.isfile(python_path):
+        return python_path
+    return sys.executable
+
+
+def _resolve_local_model_path(model_path: str = None) -> str:
+    from visual.config.user_config import get_config
+
+    resolved_path = model_path or get_config("default-model-path")
+    if not resolved_path:
+        raise LocalServiceError("No model path configured. Use --model-path or set default-model-path first.")
+    resolved_path = os.path.abspath(os.path.expanduser(resolved_path))
+    if not os.path.isdir(resolved_path):
+        raise LocalServiceError(f"Model path not found: {resolved_path}")
+    return resolved_path
+
+
+def cmd_local_start(args):
+    """Start the persistent local inference service."""
+    model_path = _resolve_local_model_path(args.model_path)
+    host = args.host or LOCAL_SERVICE_HOST
+    port = args.port or LOCAL_SERVICE_DEFAULT_PORT
+
+    existing = load_local_service_state()
+    existing_connect_host = existing.get("connect_host") or get_local_service_connect_host(existing.get("host")) if existing else None
+    if existing and is_pid_alive(existing.get("pid")) and is_port_listening(existing_connect_host, int(existing.get("port") or port)):
+        existing_model_path = os.path.abspath(os.path.expanduser(existing.get("model_path") or ""))
+        existing_host = existing.get("host") or LOCAL_SERVICE_HOST
+        existing_port = int(existing.get("port") or port)
+        if existing_model_path == model_path and existing_host == host and existing_port == port:
+            print(f"Local service already running on {existing.get('host') or LOCAL_SERVICE_HOST}:{existing.get('port') or port}")
+            if existing_connect_host and existing_connect_host != existing.get("host"):
+                print(f"Local access: {existing_connect_host}:{existing.get('port') or port}")
+            print(f"Model: {existing_model_path}")
+            return 0
+        if existing_model_path == model_path:
+            print("Error: Local service is already running with a different host or port.")
+            print(f"Current: {existing_host}:{existing_port}")
+            print(f"Requested: {host}:{port}")
+            print("Run: mano-cua local stop")
+            return 1
+        print("Error: Local service is already running with a different model.")
+        print(f"Current: {existing_model_path}")
+        print(f"Requested: {model_path}")
+        print("Run: mano-cua local stop")
+        return 1
+
+    if existing:
+        delete_local_service_state()
+
+    token = validate_local_service_token(args.token) if args.token else generate_local_service_token()
+
+    if args.foreground:
+        service = LocalInferenceService(model_path=model_path, host=host, port=port, token=token)
+        service.preload()
+        service.persist_state()
+        print(f"Local service ready on {host}:{port}")
+        connect_host = get_local_service_connect_host(host)
+        if connect_host != host:
+            print(f"Local access: {connect_host}:{port}")
+        print(f"Model: {model_path}")
+        service.serve_forever()
+        return 0
+
+    python_exec = _resolve_local_service_python()
+    cmd = [
+        python_exec,
+        "-m",
+        "visual.vla",
+        "local",
+        "start",
+        "--foreground",
+        "--port",
+        str(port),
+        "--host",
+        host,
+        "--model-path",
+        model_path,
+    ]
+    env = os.environ.copy()
+    src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env["PYTHONPATH"] = src_dir + ((":" + env.get("PYTHONPATH", "")) if env.get("PYTHONPATH") else "")
+    env["MANO_LOCAL_SERVICE_TOKEN"] = token
+
+    with open(os.path.expanduser("~/.mano/local-service.log"), "a", encoding="utf-8") as log_file:
+        process = subprocess.Popen(
+            cmd,
+            stdout=log_file,
+            stderr=log_file,
+            env=env,
+            cwd=src_dir,
+        )
+
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        if process.poll() is not None:
+            delete_local_service_state()
+            print("Error: Local service failed to start. Check ~/.mano/local-service.log")
+            return 1
+        state = load_local_service_state()
+        connect_host = state.get("connect_host") or get_local_service_connect_host(state.get("host")) if state else None
+        if state and state.get("pid") == process.pid and is_port_listening(connect_host, int(state.get("port") or port)):
+            try:
+                status = _local_service_request("GET", "/v1/local/status", timeout=10)
+            except LocalServiceError:
+                time.sleep(1)
+                continue
+            if status.get("ready"):
+                bind_host = status.get("host") or host
+                print(f"Local service ready on {bind_host}:{status.get('port')}")
+                status_connect_host = status.get("connect_host") or get_local_service_connect_host(bind_host)
+                if status_connect_host != bind_host:
+                    print(f"Local access: {status_connect_host}:{status.get('port')}")
+                print(f"Model: {status.get('model_path')}")
+                return 0
+        time.sleep(1)
+
+    print("Error: Timed out waiting for local service to become ready. Check ~/.mano/local-service.log")
+    return 1
+
+
+def cmd_local_status(args):
+    """Show local inference service status."""
+    state = load_local_service_state()
+    if not state:
+        print("Local service: not running")
+        return 1
+
+    pid = state.get("pid")
+    host = state.get("host") or LOCAL_SERVICE_HOST
+    connect_host = state.get("connect_host") or get_local_service_connect_host(host)
+    port = int(state.get("port") or LOCAL_SERVICE_DEFAULT_PORT)
+    if not is_pid_alive(pid) or not is_port_listening(connect_host, port):
+        delete_local_service_state()
+        print("Local service: not running")
+        return 1
+
+    try:
+        data = _local_service_request("GET", "/v1/local/status", timeout=10)
+    except LocalServiceError as exc:
+        print(f"Local service: unavailable ({exc})")
+        return 1
+
+    state_label = "ready/busy" if data.get("active_session") else "ready/idle"
+    print(f"Local service: {state_label}")
+    print(f"Host: {host}")
+    if connect_host != host:
+        print(f"Local access: {connect_host}")
+    print(f"Port: {data.get('port')}")
+    print(f"PID: {data.get('pid')}")
+    print(f"Model: {data.get('model_path')}")
+    print(f"Started at: {data.get('started_at')}")
+    if data.get("active_session"):
+        print(f"Active session: {data.get('active_session')} (client pid: {data.get('client_pid')})")
+    if data.get("cleanup"):
+        print(f"Cleanup: {data.get('cleanup')}")
+    elif data.get("last_cleanup"):
+        print(f"Cleanup: {data.get('last_cleanup')}")
+    return 0
+
+
+def cmd_local_stop(args):
+    """Stop the persistent local inference service when idle."""
+    state = load_local_service_state()
+    if not state:
+        print("Local service is not running.")
+        return 0
+
+    pid = state.get("pid")
+    host = state.get("connect_host") or get_local_service_connect_host(state.get("host"))
+    port = int(state.get("port") or LOCAL_SERVICE_DEFAULT_PORT)
+    if not is_pid_alive(pid) or not is_port_listening(host, port):
+        delete_local_service_state()
+        print("Local service is not running.")
+        return 0
+
+    try:
+        data = _local_service_request("POST", "/v1/local/shutdown", {}, timeout=10)
+    except LocalServiceError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        current = load_local_service_state()
+        if not current:
+            print("Local service stopped.")
+            return 0
+        if not is_pid_alive(current.get("pid")):
+            delete_local_service_state()
+            print("Local service stopped.")
+            return 0
+        time.sleep(0.5)
+
+    print("Local service is shutting down. Check `mano-cua local status` in a moment.")
+    return 0
 
 
 def cmd_check(args):
@@ -321,7 +640,6 @@ def cmd_install_sdk(args):
     print(f"\nSDK ready. Python path set to: {venv_python}")
     print("Run 'mano-cua check' to verify.")
     return 0
-    return 0
 
 
 def cmd_install_model(args):
@@ -375,11 +693,32 @@ def main():
     run_parser.add_argument("--max-steps", help="Maximum number of steps", type=int, default=100)
     run_parser.add_argument("--local", help="Use local model inference (MLX)", action="store_true", default=False)
     run_parser.add_argument("--model-path", help="Local model weights path (overrides config)", default=None)
+    run_parser.add_argument("--local-service-host", help="Remote local inference service host for --local mode", default=None)
+    run_parser.add_argument("--local-service-port", help=f"Remote local inference service port (default: {LOCAL_SERVICE_DEFAULT_PORT})", type=int, default=LOCAL_SERVICE_DEFAULT_PORT)
+    run_parser.add_argument("--local-service-token", help="Remote local inference service token for --local mode", default=None)
     run_parser.add_argument("--url", help="Open URL in browser before starting task", default=None)
+    run_parser.add_argument(
+        "--screenshot-cache-dir",
+        help="Persist task-start, per-step, and task-end screenshots under the given directory",
+        default=None,
+    )
     run_parser.add_argument("--app", help="Open app before starting task (use macOS app name, e.g. 'Notes', 'Safari', 'Google Chrome')", default=None)
 
     # --- stop ---
     subparsers.add_parser("stop", help="Stop the current running task")
+
+    # --- local service management ---
+    local_parser = subparsers.add_parser("local", help="Manage the persistent local inference service")
+    local_subparsers = local_parser.add_subparsers(dest="local_command")
+
+    local_start_parser = local_subparsers.add_parser("start", help="Start the persistent local inference service")
+    local_start_parser.add_argument("--model-path", help="Local model weights path (overrides config)", default=None)
+    local_start_parser.add_argument("--host", help=f"Bind host (default: {LOCAL_SERVICE_HOST}; use 0.0.0.0 for LAN access)", default=LOCAL_SERVICE_HOST)
+    local_start_parser.add_argument("--port", help=f"Service port (default: {LOCAL_SERVICE_DEFAULT_PORT})", type=int, default=LOCAL_SERVICE_DEFAULT_PORT)
+    local_start_parser.add_argument("--token", help="Custom access token/passphrase for the local inference service", default=None)
+    local_start_parser.add_argument("--foreground", help="Run the local service in the foreground", action="store_true", default=False)
+    local_subparsers.add_parser("status", help="Show persistent local inference service status")
+    local_subparsers.add_parser("stop", help="Stop the persistent local inference service when idle")
 
     # --- config ---
     config_parser = subparsers.add_parser("config", help="Manage persistent config")
@@ -413,6 +752,31 @@ def main():
         ret = stop_session()
         return ret
 
+    if args.command == "local":
+        if args.local_command == "start":
+            token = os.environ.get("MANO_LOCAL_SERVICE_TOKEN")
+            if args.foreground:
+                if not token:
+                    print("Error: MANO_LOCAL_SERVICE_TOKEN is required for foreground local service mode.")
+                    return 1
+                service = LocalInferenceService(
+                    model_path=_resolve_local_model_path(args.model_path),
+                    host=args.host or LOCAL_SERVICE_HOST,
+                    port=args.port,
+                    token=token,
+                )
+                service.preload()
+                service.persist_state()
+                service.serve_forever()
+                return 0
+            return cmd_local_start(args)
+        if args.local_command == "status":
+            return cmd_local_status(args)
+        if args.local_command == "stop":
+            return cmd_local_stop(args)
+        print("Usage: mano-cua local {start|status|stop}")
+        return 1
+
     if args.command == "config":
         return cmd_config(args)
 
@@ -429,6 +793,12 @@ def main():
         if not args.task:
             print("Error: task is required for 'run' command")
             return 1
+        if args.local_service_host and not args.local:
+            print("Error: --local-service-host can only be used with --local.")
+            return 1
+        if args.local_service_token and not args.local_service_host:
+            print("Error: --local-service-token requires --local-service-host.")
+            return 1
         return run_task(
             args.task,
             expected_result=args.expected_result,
@@ -436,7 +806,11 @@ def main():
             max_steps=args.max_steps,
             local=args.local,
             model_path=args.model_path,
+            local_service_host=args.local_service_host,
+            local_service_port=args.local_service_port,
+            local_service_token=args.local_service_token,
             url=args.url,
+            screenshot_cache_dir=args.screenshot_cache_dir,
             app=args.app,
         )
 

@@ -1,12 +1,10 @@
 """Platform-aware key normalization for actions (ported from mano-afk-public)."""
 
-import platform
 from copy import deepcopy
 
 
 def normalize_actions(actions):
     """Normalize key/modifier names for the current platform."""
-    is_macos = platform.system() == "Darwin"
     click_actions = {"left_click", "right_click", "double_click", "middle_click", "triple_click"}
 
     normalized = []
@@ -16,12 +14,12 @@ def normalize_actions(actions):
         action = str(tool_input.get("action") or "").strip().lower()
 
         if action == "key":
-            mods, mains = _normalize_combo_to_mods_and_mains(tool_input.get("text"), is_macos)
+            mods, mains = _normalize_key_fields(tool_input)
             tool_input["modifiers"] = mods
             tool_input["mains"] = mains
 
         elif action in click_actions:
-            mods, _ = _normalize_combo_to_mods_and_mains(tool_input.get("text"), is_macos)
+            mods = _normalize_click_modifiers(tool_input)
             tool_input["modifiers"] = mods
 
         item["input"] = tool_input
@@ -30,19 +28,56 @@ def normalize_actions(actions):
     return normalized
 
 
-def _normalize_combo_to_mods_and_mains(combo, is_macos):
+def _normalize_key_fields(tool_input):
+    combo_text = tool_input.get("text")
+    if combo_text:
+        return _normalize_combo_to_mods_and_mains(combo_text)
+
+    modifiers = _normalize_modifier_list(tool_input.get("modifiers"))
+    mains = _normalize_main_list(tool_input.get("mains"))
+    return modifiers, mains
+
+
+def _normalize_click_modifiers(tool_input):
+    combo_text = tool_input.get("text")
+    if combo_text:
+        modifiers, _ = _normalize_combo_to_mods_and_mains(combo_text)
+        return modifiers
+    return _normalize_modifier_list(tool_input.get("modifiers"))
+
+
+def _normalize_combo_to_mods_and_mains(combo):
     parts = _split_combo(combo)
     modifiers = []
     mains = []
     for p in parts:
-        k = _normalize_key_token(p, is_macos)
+        k = _normalize_key_token(p)
         if not k:
             continue
         if _is_modifier(k):
-            modifiers.append(k)
+            if k not in modifiers:
+                modifiers.append(k)
         else:
             mains.append(k)
     return modifiers, mains
+
+
+def _normalize_modifier_list(modifiers):
+    normalized = []
+    for token in _split_combo(modifiers):
+        key = _normalize_key_token(token)
+        if key and _is_modifier(key) and key not in normalized:
+            normalized.append(key)
+    return normalized
+
+
+def _normalize_main_list(mains):
+    normalized = []
+    for token in _split_combo(mains):
+        key = _normalize_key_token(token)
+        if key and not _is_modifier(key):
+            normalized.append(key)
+    return normalized
 
 
 def _split_combo(combo):
@@ -64,25 +99,31 @@ def _is_modifier(k):
     }
 
 
-def _normalize_key_token(k, is_macos):
+def _normalize_key_token(k):
     k = str(k).strip().lower()
     k = k.replace("-", "_").replace(" ", "_")
 
-    if k in ("command", "cmd", "win", "meta", "super"):
-        return "cmd" if is_macos else "ctrl"
+    if k in ("command", "cmd"):
+        return "cmd"
     if k in ("control", "ctl", "ctrl"):
-        return "cmd" if is_macos else "ctrl"
+        return "ctrl"
     if k in ("option", "opt"):
         return "alt"
+    if k in ("meta", "super", "win"):
+        return "cmd"
 
-    if k in ("command_l", "cmd_l", "meta_l", "super_l", "win_l"):
-        return "cmd_l" if is_macos else "ctrl_l"
-    if k in ("command_r", "cmd_r", "meta_r", "super_r", "win_r"):
-        return "cmd_r" if is_macos else "ctrl_r"
+    if k in ("command_l", "cmd_l"):
+        return "cmd_l"
+    if k in ("command_r", "cmd_r"):
+        return "cmd_r"
     if k in ("control_l", "ctl_l", "ctrl_l"):
-        return "cmd_l" if is_macos else "ctrl_l"
+        return "ctrl_l"
     if k in ("control_r", "ctl_r", "ctrl_r"):
-        return "cmd_r" if is_macos else "ctrl_r"
+        return "ctrl_r"
+    if k in ("meta_l", "super_l", "win_l"):
+        return "cmd_l"
+    if k in ("meta_r", "super_r", "win_r"):
+        return "cmd_r"
     if k in ("option_l", "opt_l"):
         return "alt_l"
     if k in ("option_r", "opt_r"):
@@ -100,7 +141,6 @@ def _normalize_key_token(k, is_macos):
         "arrowright": "right", "arrow_right": "right",
         "pageup": "page_up", "pgup": "page_up",
         "pagedown": "page_down", "pgdn": "page_down",
-        "delete": "backspace",
-        "del": "backspace",
+        "del": "delete",
     }
     return alias_map.get(k, k)

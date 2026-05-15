@@ -39,13 +39,18 @@ mano-cua run "your task description"
 mano-cua run "task" --minimize --max-steps 10
 
 # Open a URL in the browser before starting the task
-mano-cua run "task" --url "https://example.com"
+mano-cua run --url "https://example.com" "task"
 
 # Open an app before starting the task (use the macOS app name, e.g. 'Notes', 'Safari', 'Google Chrome')
-mano-cua run "task" --app "Notes"
+mano-cua run --app "Notes" "task"
+
+# Start, inspect, or stop the local inference service
+mano-cua local start
+mano-cua local status
+mano-cua local stop
 
 # Run in local mode (on-device inference, macOS Apple Silicon only)
-mano-cua run "task" --local
+mano-cua run --local "task"
 
 # Stop the current running task
 mano-cua stop
@@ -69,22 +74,24 @@ Runs [Mano-P](https://huggingface.co/Mininglamp-2718/Mano-P) entirely on-device 
 mano-cua check
 mano-cua install-sdk
 mano-cua install-model
+mano-cua local start
 ```
 
 **Run:**
 
 ```bash
-mano-cua run "click the search box, type openai, click search, click the first result to open OpenAI homepage" --local --url "https://www.google.com"
-mano-cua run "click the search box, type iphone, click the search button, open the first post" --local --url "https://www.xiaohongshu.com" --minimize --max-steps 15
-mano-cua run "create a new note and type hello world" --local --app "Notes"
+mano-cua run --local --url "https://www.google.com" "click the search box, type openai, click search, click the first result to open OpenAI homepage"
+mano-cua run --local --url "https://www.xiaohongshu.com" --minimize --max-steps 15 "click the search box, type iphone, click the search button, open the first post"
+mano-cua run --local --app "Notes" "create a new note and type hello world"
 ```
 
 ## Examples
 
 ```bash
 # Local mode (recommended for privacy — all inference on-device, no data leaves the machine)
-mano-cua run "click the search box, type openai, click search, click the first result" --local --url "https://www.google.com" --minimize
-mano-cua run "create a new note and type hello world" --local --app "Notes"
+mano-cua local start
+mano-cua run --local --url "https://www.google.com" --minimize "click the search box, type openai, click search, click the first result"
+mano-cua run --local --app "Notes" "create a new note and type hello world"
 
 # Cloud mode
 mano-cua run "Open Notes and create a new note titled Meeting Summary"
@@ -112,7 +119,7 @@ In **local mode (`--local`)**, a local Mano-P model runs on-device via MLX. No n
 
 **Structural capability boundaries (what the tool cannot do):**
 
-- Cannot run in the background or persist between sessions — each invocation is a single, short-lived task.
+- The GUI automation task itself is still foreground and short-lived. Only the local inference model may persist in a background service between local runs.
 - Cannot access the filesystem, clipboard, network, or any data beyond what is visible on the primary display.
 - Cannot interact with secondary monitors — only the primary display is used.
 - Cannot bypass OS-level permission dialogs or security prompts.

@@ -80,9 +80,12 @@ class ComputerActionExecutor:
                         sx, sy = self._xy(start)
                         self.mouse_controller.position = (sx, sy)
                         time.sleep(0.2)
-                    # Start drag
+                    # Start drag and always release, even if movement fails.
                     self.mouse_controller.press(Button.left)
-                    x, y = self._mouse_move(tool_input)
+                    try:
+                        x, y = self._mouse_move(tool_input)
+                    finally:
+                        self.mouse_controller.release(Button.left)
                     msg = f"drag_to ({x},{y}) ok"
 
                 elif action == "scroll":
@@ -90,7 +93,12 @@ class ComputerActionExecutor:
                     msg = "scroll ok"
 
                 elif action == "wait":
-                    time.sleep(0.5)
+                    duration = tool_input.get("duration")
+                    try:
+                        duration = float(duration)
+                    except (TypeError, ValueError):
+                        duration = 0.5
+                    time.sleep(max(0.0, duration))
                     msg = "wait ok"
 
                 elif action == "screenshot":

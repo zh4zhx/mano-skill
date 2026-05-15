@@ -23,6 +23,7 @@ class CloudAgent(BaseAgent):
         self,
         task_instruction: str,
         tool_results: Optional[List[Dict[str, Any]]] = None,
+        expected_result: Optional[str] = None,
     ) -> Tuple[str, List[Dict[str, Any]], str, str]:
         payload = {
             "request_id": str(uuid.uuid4()),
@@ -74,8 +75,14 @@ class CloudAgent(BaseAgent):
             pass
 
     def agree_to_continue(self) -> None:
-        requests.post(
+        resp = requests.post(
             f"{self.server_url}/v1/sessions/{self.session_id}/go_no",
+            json={},
             timeout=AUTOMATION_CONFIG["SESSION_TIMEOUT"],
             headers={"Content-Type": "application/json"},
         )
+        resp.raise_for_status()
+        if resp.content:
+            data = resp.json()
+            if not data.get("ok", True):
+                raise RuntimeError(data.get("detail") or "go_no request failed")

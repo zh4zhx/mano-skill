@@ -10,11 +10,14 @@ CONFIG_DEFAULTS = {
     "max-steps": "100",
     "minimize": "false",
     "save-trajectory": "false",
+    "w8a8": "auto",
 }
 
 CONFIG_KEYS = {
     "default-model-path": "Local model weights directory (required for --local)",
     "python-path":        "Python interpreter with local deps already installed (skips install-sdk)",
+    "sdk-installed":      "Whether the local inference SDK has been installed and verified",
+    "model-installed":    "Whether the default local model path has been installed and verified",
     "w8a8":               "W8A8 INT8 acceleration: 'auto', 'on', or 'off' (default: auto, requires M5+)",
     "max-steps":          f"Maximum steps per task (default: {CONFIG_DEFAULTS['max-steps']})",
     "minimize":           f"Start with minimized UI panel: true/false (default: {CONFIG_DEFAULTS['minimize']})",

@@ -62,6 +62,9 @@ class TaskViewModel:
         if not agent:
             self._handle_continue_error("No agent available")
             return
+        if agent.agent_type == "cloud" and not self.model.state.session_id:
+            self._handle_continue_error("Session ID not available")
+            return
 
         def call_agree():
             try:
@@ -69,6 +72,10 @@ class TaskViewModel:
                     self.view.continue_button.configure(text="Submitting confirmation...", state="disabled"),
                     self.view.stop_button.configure(state="disabled"),
                 ])
+                if agent.agent_type == "cloud":
+                    self._prepend_log_message(
+                        f"Submitting user confirmation for session {self.model.state.session_id}"
+                    )
 
                 agent.agree_to_continue()
 
@@ -76,6 +83,10 @@ class TaskViewModel:
                 self.model.state.status = TASK_STATUS["RUNNING"]
                 self.model.state.is_running = True
                 self.on_model_state_changed(self.model.state)
+                if agent.agent_type == "cloud":
+                    self._prepend_log_message(
+                        f"User confirmed, session {self.model.state.session_id} resumed"
+                    )
 
                 self.view.root.after(0, lambda: [
                     self.view.status_label.configure(text="Resuming..."),
@@ -87,13 +98,28 @@ class TaskViewModel:
 
         threading.Thread(target=call_agree, daemon=True).start()
 
+    def _prepend_log_message(self, message: str):
+        """Prepend a short log message to the overlay log box."""
+        if not self.view or not self.view._ui_initialized:
+            return
+
+        def update():
+            existing = self.view.log_text.get("1.0", "end").strip()
+            content = f"{message}\n{existing}" if existing else message
+            self.view.log_text.configure(state="normal")
+            self.view.log_text.delete("1.0", "end")
+            self.view.log_text.insert("1.0", content)
+            self.view.log_text.configure(state="disabled")
+
+        self.view.root.after(0, update)
+
     # ========== New: Unified Error Handling Method ==========
     def _handle_continue_error(self, error_msg):
         """Unified handling of agree and continue error scenarios"""
+        self._prepend_log_message(f"❌ {error_msg}")
         self.view.root.after(0, lambda: [
             self.view.continue_button.configure(text="Agree and Continue", state="normal"),
             self.view.stop_button.configure(state="normal"),
-            self.view.log_text.insert("1.0", f"❌ {error_msg}\n{self.view.log_text.get('1.0', 'end')}"),
             self.view.status_label.configure(text="Confirmation failed")
         ])
 
@@ -115,7 +141,14 @@ class TaskViewModel:
         self.view.root.after(ANIMATION_CONFIG["POLL_INTERVAL"], poll_thread)
 
     # ========== Business Methods ==========
-    def init_task(self, task_name: str, agent: BaseAgent, expected_result: Optional[str] = None, max_steps: int = None) -> bool:
+    def init_task(
+        self,
+        task_name: str,
+        agent: BaseAgent,
+        expected_result: Optional[str] = None,
+        max_steps: int = None,
+        screenshot_cache_dir: Optional[str] = None,
+    ) -> bool:
         """Initialize automation task"""
         try:
             import customtkinter as ctk
@@ -124,12 +157,17 @@ class TaskViewModel:
 
             # Wire minimize callback from model to view (only minimize, never expand)
             def _minimize_if_needed():
-                if not self.view._minimized:
-                    self.view._toggle_minimize()
+                self.view.minimize_and_restore_focus()
             self.model.on_minimize_panel = lambda: self.view.root.after(0, _minimize_if_needed)
 
             # Initialize Model
-            self.model.init_task(task_name, agent, expected_result=expected_result, max_steps=max_steps)
+            self.model.init_task(
+                task_name,
+                agent,
+                expected_result=expected_result,
+                max_steps=max_steps,
+                screenshot_cache_dir=screenshot_cache_dir,
+            )
 
             # Initialize View
             self.view.show()

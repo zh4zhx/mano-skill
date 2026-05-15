@@ -4,6 +4,7 @@ import base64
 import io
 import logging
 import os
+import platform
 import re
 import time
 import uuid
@@ -20,8 +21,9 @@ LOCAL_AGENT_CONFIG = {
     "MAX_NEW_TOKENS": 2048,
     "TEMPERATURE": 0.0,
     "TOP_P": 1.0,
-    "SCREENSHOT_WIDTH": 1280,
-    "HISTORY_IMAGE_COUNT": 1,
+    "SCREENSHOT_WIDTH": 1920,
+    "HISTORY_IMAGE_COUNT": 0,
+    "STEP_MEMORY_COUNT": 4,
 }
 
 
@@ -61,6 +63,15 @@ finish() # The task is completed.
 ## Note
 - Use Chinese in `<think>` part.
 - Write a small plan and finally summarize your next action (with its target element) in one sentence in `<action_desp>` part.
+- If the user explicitly requests a keyboard shortcut such as command/cmd/ctrl/shift/alt + key, use `hotkey(key='...')` first unless the screenshot clearly shows that the shortcut has already been used or failed.
+- For `type(content='...')`, the content must be the exact literal text to input. Preserve Chinese characters, English letters, numbers, spaces, and punctuation exactly as requested. Never transliterate to pinyin, never paraphrase, and never substitute with similar words.
+- If an input box already contains unrelated text and the task is to search or replace it, clear the existing text before typing the new content.
+- Only choose a search result or feature when the visible text on screen matches the user goal or is an obvious exact follow-up. Do not infer that an unrelated result is correct.
+- If a group is already expanded and its child controls are visible, do not click the group header again and collapse it.
+- When the task names an exact slider/control label, operate only the row whose visible label exactly matches that name. Do not confuse a parent summary slider with similarly named child sliders.
+- Do not output `finish()` unless the exact target control visibly satisfies the requested end state.
+- If the current subtask is already satisfied in the screenshot, immediately proceed to the next remaining subtask. Do not wait unless the UI is visibly loading or changing.
+- If the current subtask contains an explicit shortcut or explicit literal input text, output that exact shortcut/text literally.
 
 ## User Instruction:
 {instruction}
@@ -76,6 +87,12 @@ finish() # The task is completed.
         self.processor = None
         self._custom_generate = None
         self._model_loaded = False
+        self._current_task_instruction = ""
+        self._current_expected_result = None
+        self._planned_task_key = None
+        self._stage_plan: List[Dict[str, str]] = []
+        self._current_stage_idx = 0
+        self._last_processed_tool_result_id = None
 
         self.prompt_history: list = []
         self.step_count = 0
@@ -92,7 +109,7 @@ finish() # The task is completed.
 
         # W8A8 acceleration (config: auto/on/off, default auto)
         from visual.config.user_config import get_config
-        w8a8_mode = get_config("w8a8") or "off"
+        w8a8_mode = get_config("w8a8") or "auto"
         if w8a8_mode != "off":
             try:
                 import mlx.core as mx
@@ -121,41 +138,68 @@ finish() # The task is completed.
         self._model_loaded = True
         logger.info("Local model loaded successfully.")
 
+    def preload_model(self) -> None:
+        """Eagerly load the local model for background-service startup."""
+        self._ensure_model_loaded()
+
+    def reset_task_state(self) -> None:
+        """Reset task-scoped prompt history and planning state for a new session."""
+        self._current_task_instruction = ""
+        self._current_expected_result = None
+        self._planned_task_key = None
+        self._stage_plan = []
+        self._current_stage_idx = 0
+        self._last_processed_tool_result_id = None
+        self.prompt_history = []
+        self.step_count = 0
+
     # ─── BaseAgent interface ──────────────────────────────────
 
     def predict(
         self,
         task_instruction: str,
         tool_results: Optional[List[Dict[str, Any]]] = None,
+        expected_result: Optional[str] = None,
     ) -> Tuple[str, List[Dict[str, Any]], str, str]:
         self._ensure_model_loaded()
         _t0 = time.time()
+        self._current_task_instruction = task_instruction or ""
+        self._current_expected_result = expected_result
+        self._ensure_stage_plan()
+        self._advance_stage_from_tool_results(tool_results)
 
         # 1. Extract screenshot
         screenshot_b64 = self._extract_screenshot(tool_results)
         if screenshot_b64 is None:
             screenshot_b64 = self._take_screenshot_b64()
 
-        # 2. Build prompt
-        user_text, images = self._build_prompt(task_instruction, screenshot_b64)
+        stage = self._get_current_stage()
+        deterministic = self._build_deterministic_stage_action(stage)
+        if deterministic:
+            think, action_desp, action = deterministic
+            parsed_actions = [action]
+        else:
+            # 2. Build prompt
+            user_text, images = self._build_prompt(task_instruction, screenshot_b64)
 
-        # 3. Run inference
-        response_text = self._infer(user_text, images)
-        print(f"  [model output] {response_text}")
+            # 3. Run inference
+            response_text = self._infer(user_text, images)
+            print(f"  [model output] {response_text}")
 
-        # Save raw response to file
-        self._save_raw_response(response_text)
-
-        # 4. Parse response
-        parsed = self._parse_response(response_text)
-        think = parsed["think"]
-        action_desp = parsed["action_desp"]
-        parsed_actions = parsed["actions"]
+            # 4. Parse response
+            self._save_raw_response(response_text)
+            parsed = self._parse_response(response_text)
+            think = parsed["think"]
+            action_desp = parsed["action_desp"]
+            parsed_actions = parsed["actions"]
 
         # 5. Record prompt history
         if screenshot_b64:
+            primary_action = parsed_actions[0] if parsed_actions else {}
             self.prompt_history.append({
                 "desc": action_desp or str(parsed_actions),
+                "action": primary_action,
+                "actions": parsed_actions,
                 "screenshot_b64": screenshot_b64,
             })
 
@@ -191,8 +235,194 @@ finish() # The task is completed.
     def agree_to_continue(self) -> None:
         self.prompt_history.append({
             "desc": "用户已确认继续",
+            "action": {"action": "continue"},
             "screenshot_b64": "",
         })
+
+    def _ensure_stage_plan(self) -> None:
+        task_key = (self._current_task_instruction or "", self._current_expected_result or "")
+        if task_key == self._planned_task_key:
+            return
+
+        self._planned_task_key = task_key
+        self._stage_plan = self._build_stage_plan(self._current_task_instruction)
+        self._current_stage_idx = 0
+        self._last_processed_tool_result_id = None
+        self.prompt_history = []
+        self.step_count = 0
+
+    def _build_stage_plan(self, task: str) -> List[Dict[str, str]]:
+        if not task:
+            return []
+
+        normalized = task.strip()
+        normalized = re.sub(r"\s+", " ", normalized)
+        normalized = normalized.replace("，", "\n").replace("。", "\n").replace("；", "\n")
+        normalized = normalized.replace(",", "\n").replace(";", "\n")
+        normalized = re.sub(r"(页面)\s*(切换到)", r"\1\n\2", normalized)
+        normalized = re.sub(r"(分组)\s*(选择)", r"\1\n\2", normalized)
+        normalized = re.sub(r"(后)\s*(再)", r"\1\n\2", normalized)
+
+        raw_parts = [part.strip(" .") for part in normalized.splitlines() if part.strip(" .")]
+        stages: List[Dict[str, str]] = []
+
+        action_keywords = ("选", "双击", "进入", "切换", "键盘输入", "按", "调整", "选择", "展开", "点击", "打开", "清空", "输入", "搜索", "滚动", "确认")
+        context_prefixes = ("当前", "目前", "已经", "此时")
+
+        for part in raw_parts:
+            sub_parts = self._split_stage_clause(part)
+            for sub in sub_parts:
+                clause = sub.strip(" .")
+                if not clause:
+                    continue
+                if clause.startswith(context_prefixes) and any(token in clause for token in ("已经打开", "已打开", "已经进入", "已进入")):
+                    continue
+                if clause.startswith(context_prefixes) and not any(k in clause for k in action_keywords):
+                    continue
+                if not any(k in clause for k in action_keywords):
+                    continue
+                hint = self._infer_stage_hint(clause)
+                stage = {"text": clause, "hint": hint}
+                hotkey = self._extract_shortcut_from_text(clause)
+                literal_text = self._extract_literal_text_from_stage(clause)
+                if hotkey:
+                    stage["hotkey"] = hotkey
+                if literal_text:
+                    stage["literal_text"] = literal_text
+                stages.append(stage)
+
+        return stages
+
+    def _split_stage_clause(self, clause: str) -> List[str]:
+        parts = [clause]
+        split_patterns = [
+            r"(进入[^，。；]*?页面)\s*(切换到[^，。；]*?页面)",
+            r"(打开[^，。；]*?后)\s*(?:如果[^，。；]*?先清空)",
+            r"(先清空[^，。；]*)\s*(再[^，。；]*)",
+        ]
+        changed = True
+        while changed:
+            changed = False
+            new_parts: List[str] = []
+            for part in parts:
+                split_done = False
+                for pattern in split_patterns:
+                    match = re.search(pattern, part)
+                    if match:
+                        new_parts.extend([g for g in match.groups() if g and g.strip()])
+                        split_done = True
+                        changed = True
+                        break
+                if not split_done:
+                    new_parts.append(part)
+            parts = new_parts
+        return parts
+
+    def _infer_stage_hint(self, clause: str) -> str:
+        if "双击" in clause:
+            return "doubleclick"
+        if any(k in clause.lower() for k in ("cmd+", "command+", "ctrl+", "alt+", "shift+")) or "键盘输入" in clause or "快捷键" in clause:
+            return "hotkey"
+        if "调整" in clause or "滑杆" in clause or "拖动" in clause:
+            return "drag"
+        if "输入" in clause:
+            return "type"
+        if "滚动" in clause:
+            return "scroll"
+        if "等待" in clause:
+            return "wait"
+        if any(k in clause for k in ("点击", "选择", "切换", "展开", "进入", "打开", "确认")):
+            return "click"
+        return "generic"
+
+    def _advance_stage_from_tool_results(self, tool_results: Optional[List[Dict[str, Any]]]) -> None:
+        if not tool_results or not self._stage_plan or self._current_stage_idx >= len(self._stage_plan):
+            return
+
+        last_id = tool_results[-1].get("tool_use_id")
+        if not last_id or last_id == self._last_processed_tool_result_id:
+            return
+        self._last_processed_tool_result_id = last_id
+
+        if not all(tr.get("status") == "success" for tr in tool_results):
+            return
+        if not self.prompt_history:
+            return
+
+        history_entry = self.prompt_history[-1]
+        action_names = [
+            action.get("action") or ""
+            for action in (history_entry.get("actions") or [])
+            if isinstance(action, dict)
+        ]
+        if not action_names:
+            fallback_action = (history_entry.get("action") or {}).get("action") or ""
+            action_names = [fallback_action]
+        current_hint = self._stage_plan[self._current_stage_idx]["hint"]
+        if any(self._action_matches_stage_hint(action_name, current_hint) for action_name in action_names):
+            self._current_stage_idx += 1
+
+    def _action_matches_stage_hint(self, action_name: str, hint: str) -> bool:
+        if hint == "doubleclick":
+            return action_name == "doubleclick"
+        if hint == "hotkey":
+            return action_name == "hotkey"
+        if hint == "drag":
+            return action_name in ("drag", "click")
+        if hint == "type":
+            return action_name == "type"
+        if hint == "scroll":
+            return action_name == "scroll"
+        if hint == "wait":
+            return action_name == "wait"
+        if hint == "click":
+            return action_name in ("click", "doubleclick", "hotkey_click")
+        return action_name not in ("finish", "stop", "call_user", "")
+
+    def _get_current_stage(self) -> Optional[Dict[str, str]]:
+        if not self._stage_plan:
+            return None
+        if self._current_stage_idx >= len(self._stage_plan):
+            return None
+        return self._stage_plan[self._current_stage_idx]
+
+    def _extract_shortcut_from_text(self, text: str) -> Optional[str]:
+        patterns = [
+            r"(cmd\s*\+\s*[A-Za-z0-9])",
+            r"(command\s*\+\s*[A-Za-z0-9])",
+            r"(ctrl\s*\+\s*[A-Za-z0-9])",
+            r"(alt\s*\+\s*[A-Za-z0-9])",
+            r"(shift\s*\+\s*[A-Za-z0-9])",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return re.sub(r"\s+", "", match.group(1))
+        return None
+
+    def _extract_literal_text_from_stage(self, text: str) -> Optional[str]:
+        quote_match = re.search(r"[“\"]([^”\"]+)[”\"]", text)
+        if quote_match:
+            return quote_match.group(1).strip()
+        return None
+
+    def _build_deterministic_stage_action(self, stage: Optional[Dict[str, str]]) -> Optional[Tuple[str, str, dict]]:
+        if not stage:
+            return None
+
+        if stage.get("hint") == "hotkey" and stage.get("hotkey"):
+            hotkey = stage["hotkey"]
+            think = f"当前子任务是显式快捷键步骤，需要直接执行 {hotkey}。"
+            action_desp = f"执行快捷键 {hotkey}，完成当前子任务：{stage['text']}。"
+            return think, action_desp, {"action": "hotkey", "key": hotkey}
+
+        if stage.get("hint") == "type" and stage.get("literal_text"):
+            literal_text = stage["literal_text"]
+            think = f"当前子任务是显式文本输入步骤，需要原样输入“{literal_text}”。"
+            action_desp = f"原样输入“{literal_text}”，完成当前子任务：{stage['text']}。"
+            return think, action_desp, {"action": "type", "text": literal_text}
+
+        return None
 
     # ─── Screenshot handling ──────────────────────────────────
 
@@ -230,22 +460,49 @@ finish() # The task is completed.
         import platform as _platform
         images: list = []
         history_count = self.cfg["HISTORY_IMAGE_COUNT"]
-        recent = self.prompt_history[-(history_count + 1):]
+        recent = self.prompt_history[-history_count:] if history_count > 0 else []
+        step_memory_count = self.cfg["STEP_MEMORY_COUNT"]
+        step_memory = self.prompt_history[-step_memory_count:]
 
-        history_parts = []
-        for i, h in enumerate(self.prompt_history):
-            step_num = i + 1
-            desc = h["desc"]
-            if h in recent and h.get("screenshot_b64"):
-                images.append(h["screenshot_b64"])
-                history_parts.append(f"第{step_num}步：{desc}，对应的截图为<image>")
+        summary_parts = []
+        for idx, h in enumerate(step_memory):
+            step_num = self.step_count - len(step_memory) + idx + 1
+            desc = h.get("desc") or ""
+            actions = h.get("actions") or []
+            if actions:
+                action_name = " -> ".join((action.get("action") or "unknown") for action in actions)
             else:
-                history_parts.append(f"第{step_num}步：{desc}")
+                action = h.get("action") or {}
+                action_name = action.get("action") or "unknown"
+            summary_parts.append(f"第{step_num}步：动作={action_name}；说明={desc}")
 
-        history_text = "\n".join(history_parts) if history_parts else "无"
+        visual_parts = []
+        for idx, h in enumerate(recent):
+            step_num = self.step_count - len(recent) + idx + 1
+            desc = h.get("desc") or ""
+            if h.get("screenshot_b64"):
+                images.append(h["screenshot_b64"])
+                visual_parts.append(f"第{step_num}步截图：{desc}，对应截图为<image>")
+
+        history_text = "\n".join(summary_parts) if summary_parts else "无"
+        visual_history_text = "\n".join(visual_parts) if visual_parts else "无"
 
         instruction_parts = [f"### task: {task}"]
+        if self._current_expected_result:
+            instruction_parts.append(f"### expected result: {self._current_expected_result}")
+        if self._stage_plan:
+            current_stage = self._stage_plan[min(self._current_stage_idx, len(self._stage_plan) - 1)]
+            instruction_parts.append(f"### current subtask: {current_stage['text']}")
+            remaining = [s["text"] for s in self._stage_plan[self._current_stage_idx + 1:]]
+            instruction_parts.append(
+                "### remaining subtasks: " + (" | ".join(remaining) if remaining else "无")
+            )
+        task_constraints = self._build_task_constraints(task)
+        if task_constraints:
+            instruction_parts.append("### task constraints:")
+            instruction_parts.extend(task_constraints)
         instruction_parts.append(f"### action history: {history_text}")
+        instruction_parts.append(f"### recent visual history: {visual_history_text}")
         if current_screenshot_b64:
             images.append(current_screenshot_b64)
             instruction_parts.append("当前截图为<image>")
@@ -255,6 +512,50 @@ finish() # The task is completed.
             instruction="\n".join(instruction_parts),
         )
         return text, images
+
+    def _build_task_constraints(self, task: str) -> List[str]:
+        """Extract explicit task constraints that help small local models stay grounded."""
+        constraints: List[str] = []
+
+        if self._current_expected_result:
+            constraints.append(f"- 最终完成条件：{self._current_expected_result}")
+
+        group_patterns = [
+            r"确认([^，。；]+?)分组展开",
+            r"展开([^，。；]+?)分组",
+        ]
+        seen_groups = set()
+        for pattern in group_patterns:
+            for match in re.finditer(pattern, task):
+                group_name = match.group(1).strip()
+                if group_name and group_name not in seen_groups:
+                    seen_groups.add(group_name)
+                    constraints.append(f"- 目标分组是“{group_name}”。如果该分组已经展开并且子控件可见，不要再次点击它的标题。")
+
+        slider_match = re.search(r"调整([^，。；]+?)滑杆至(\d+)", task)
+        if not slider_match and self._current_expected_result:
+            slider_match = re.search(r"([^，。；]+?)调整至(\d+)", self._current_expected_result)
+        if slider_match:
+            slider_name = slider_match.group(1).strip()
+            slider_value = slider_match.group(2).strip()
+            constraints.append(f"- 精确目标滑杆名称是“{slider_name}”，目标数值是 {slider_value}。")
+            constraints.append(f"- 只能操作屏幕上标签文字与“{slider_name}”完全一致的那一行。")
+            constraints.append(f"- 如果同时看到总滑杆/父滑杆和名称相近的子滑杆，不要把子滑杆当成“{slider_name}”。")
+            constraints.append(f"- 只有当标签为“{slider_name}”的那一行可见数值达到 {slider_value} 时，才允许结束任务。")
+
+        page_match = re.search(r"切换到([^，。；]+?)页面", task)
+        if page_match:
+            page_name = page_match.group(1).strip()
+            constraints.append(f"- 在执行后续调节前，先确认当前页面确实是“{page_name}”页面。")
+
+        if self._stage_plan and self._current_stage_idx < len(self._stage_plan):
+            current_stage = self._stage_plan[self._current_stage_idx]["text"]
+            constraints.append(f"- 当前只专注完成这个子任务：“{current_stage}”。")
+            constraints.append("- 在当前子任务明显完成前，不要提前跳到后面的步骤。")
+            if self._current_stage_idx < len(self._stage_plan) - 1:
+                constraints.append("- 在所有子任务完成前，不要输出 finish()。")
+
+        return constraints
 
     # ─── Inference ────────────────────────────────────────────
 
@@ -323,11 +624,56 @@ finish() # The task is completed.
             return [0, 0]
         return [int(m.group(1)), int(m.group(2))]
 
+    def _parse_hotkey_spec(self, key_spec: str) -> Tuple[List[str], List[str]]:
+        """Parse hotkey text like 'cmd+c' into executor modifiers/mains."""
+        if not key_spec:
+            return [], []
+
+        alias_map = {
+            "cmd": "cmd",
+            "command": "cmd",
+            "meta": "cmd",
+            "win": "cmd",
+            "super": "cmd",
+            "ctrl": "ctrl",
+            "control": "ctrl",
+            "alt": "alt",
+            "option": "alt",
+            "opt": "alt",
+            "shift": "shift",
+            "enter": "enter",
+            "return": "enter",
+            "esc": "esc",
+            "escape": "esc",
+            "space": "space",
+            "tab": "tab",
+            "backspace": "backspace",
+            "delete": "delete",
+            "up": "up",
+            "down": "down",
+            "left": "left",
+            "right": "right",
+        }
+        modifier_keys = {"cmd", "ctrl", "alt", "shift"}
+
+        parts = [p.strip().lower() for p in re.split(r"(?:\s*\+\s*|\s+)", key_spec) if p.strip()]
+        modifiers: List[str] = []
+        mains: List[str] = []
+        for part in parts:
+            key_name = alias_map.get(part, part)
+            if key_name in modifier_keys:
+                if key_name not in modifiers:
+                    modifiers.append(key_name)
+            else:
+                mains.append(key_name)
+
+        return modifiers, mains
+
     def _parse_action(self, action_str: str) -> Optional[dict]:
         action_str = action_str.strip()
         m = re.match(r"(\w+)\((.*)\)$", action_str, re.DOTALL)
         if not m:
-            return None
+            return self._parse_fallback_action(action_str)
 
         func_name = m.group(1)
         args_str = m.group(2).strip()
@@ -384,6 +730,46 @@ finish() # The task is completed.
             return {"action": "call_user"}
         return None
 
+    def _parse_fallback_action(self, action_str: str) -> Optional[dict]:
+        """Parse looser action formats such as 'scroll;dir=down;amount=3'."""
+        if not action_str or ";" not in action_str:
+            return None
+
+        parts = [part.strip() for part in action_str.split(";") if part.strip()]
+        if not parts:
+            return None
+
+        func_name = parts[0].lower()
+        kwargs = {}
+        for part in parts[1:]:
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            kwargs[key.strip().lower()] = value.strip().strip("'\"")
+
+        if func_name == "scroll":
+            amount = kwargs.get("amount", "5")
+            try:
+                amount = int(amount)
+            except (ValueError, TypeError):
+                amount = 5
+            result = {
+                "action": "scroll",
+                "direction": kwargs.get("direction") or kwargs.get("dir", "down"),
+                "amount": amount,
+            }
+            return result
+
+        if func_name == "wait":
+            duration = kwargs.get("duration", kwargs.get("seconds", "5"))
+            try:
+                duration = float(duration)
+            except (ValueError, TypeError):
+                duration = 5.0
+            return {"action": "wait", "duration": duration}
+
+        return None
+
     # ─── Action conversion: Qwen3-VL → Claude format ─────────
 
     def _norm_coord(self, x: int, y: int) -> list:
@@ -407,6 +793,8 @@ finish() # The task is completed.
             at = (a.get("action_type") or "").upper()
             if at == "DONE":
                 return "DONE"
+            if at == "STOP":
+                return "STOP"
             if at == "FAIL":
                 return "FAIL"
             if at == "CALL_USER":
@@ -419,7 +807,7 @@ finish() # The task is completed.
             return ""
         a = actions[0]
         at = (a.get("action_type") or "").upper()
-        if at in ("DONE", "FAIL", "CALL_USER"):
+        if at in ("DONE", "STOP", "FAIL", "CALL_USER"):
             return at
         inp = a.get("input", {})
         name = a.get("name", "")
@@ -431,6 +819,9 @@ finish() # The task is completed.
         coord = inp.get("coordinate")
         if coord:
             return f"{action}({coord[0]}, {coord[1]})"
+        if action == "key":
+            combo = self._format_key_combo(inp.get("modifiers"), inp.get("mains"))
+            return f'key("{combo}")' if combo else "key"
         text = inp.get("text")
         if text:
             return f"{action}(\"{text[:30]}\")"
@@ -438,6 +829,16 @@ finish() # The task is completed.
         if direction:
             return f"{action} {direction}"
         return action
+
+    def _format_key_combo(self, modifiers: Optional[List[str]], mains: Optional[List[str]]) -> str:
+        parts: List[str] = []
+        for token in (modifiers or []):
+            if token:
+                parts.append(str(token))
+        for token in (mains or []):
+            if token:
+                parts.append(str(token))
+        return "+".join(parts)
 
     def _convert_action(self, action: dict) -> List[Dict[str, Any]]:
         """Convert parsed Qwen3-VL action to Claude-compatible action list."""
@@ -460,7 +861,7 @@ finish() # The task is completed.
                 "action_type": "tool_use",
             }]
         if act == "stop":
-            return [{"action_type": "FAIL"}]
+            return [{"action_type": "STOP"}]
         if act == "call_user":
             return [{"action_type": "CALL_USER"}]
 
@@ -501,10 +902,11 @@ finish() # The task is completed.
 
         if act == "hotkey_click":
             coords = action.get("coords", [0, 0])
+            modifiers, _ = self._parse_hotkey_spec(action.get("key", ""))
             return [self._make_tool_action({
                 "action": "left_click",
                 "coordinate": self._norm_coord(coords[0], coords[1]),
-                "text": action.get("key", ""),
+                "modifiers": modifiers,
             })]
 
         if act == "type":
@@ -514,9 +916,11 @@ finish() # The task is completed.
             })]
 
         if act == "hotkey":
+            modifiers, mains = self._parse_hotkey_spec(action.get("key", ""))
             return [self._make_tool_action({
                 "action": "key",
-                "text": action.get("key", ""),
+                "modifiers": modifiers,
+                "mains": mains,
             })]
 
         if act == "scroll":
