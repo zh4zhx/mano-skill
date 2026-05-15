@@ -46,6 +46,7 @@ class TaskModel:
         self._screenshot_cache_seq = 0
         self._screenshot_cache_disabled = False
         self._screenshot_cache_session_key: Optional[str] = None
+        self._task_start_screenshot_bytes: Optional[bytes] = None
 
         # Trajectory saving
         self._save_trajectory = False
@@ -131,6 +132,7 @@ class TaskModel:
         self._screenshot_cache_seq = 0
         self._screenshot_cache_disabled = False
         self._screenshot_cache_session_key = None
+        self._task_start_screenshot_bytes = None
 
     def _disable_screenshot_cache(self, error: Exception):
         """Disable cache writes after a filesystem failure."""
@@ -241,12 +243,33 @@ class TaskModel:
 
     def _capture_task_start_screenshot(self):
         """Capture and cache the task-start screenshot."""
-        if not self.screenshot_cache_dir or self._screenshot_cache_disabled:
-            return
         try:
-            self._record_cached_screenshot(screenshot_to_bytes(), phase="task_start")
+            png_bytes = screenshot_to_bytes()
+            self._task_start_screenshot_bytes = png_bytes
+            if not self.screenshot_cache_dir or self._screenshot_cache_disabled:
+                return
+            self._record_cached_screenshot(png_bytes, phase="task_start")
         except Exception as error:
-            self._disable_screenshot_cache(error)
+            self._task_start_screenshot_bytes = None
+            if self.screenshot_cache_dir and not self._screenshot_cache_disabled:
+                self._disable_screenshot_cache(error)
+
+    def _build_initial_tool_results(self) -> List[Dict[str, Any]]:
+        """Return the initial screenshot as a tool result when the agent needs caller-side capture."""
+        if not self._task_start_screenshot_bytes:
+            return []
+        if not getattr(self.agent, "uses_remote_service", False):
+            return []
+        return [
+            make_tool_result(
+                tool_use_id="initial-screenshot",
+                ok=True,
+                message="initial screenshot captured",
+                include_screenshot=True,
+                screenshot_bytes=self._task_start_screenshot_bytes,
+                meta={"phase": "task_start"},
+            )
+        ]
 
     def _capture_task_end_screenshot(self):
         """Capture and cache the task-end screenshot."""
@@ -414,7 +437,7 @@ class TaskModel:
 
     def _execute_task_steps(self):
         """Execute task step loop"""
-        tool_results: List[Dict[str, Any]] = []
+        tool_results: List[Dict[str, Any]] = self._build_initial_tool_results()
         step_idx = 0
 
         while self.state.is_running and not self.stop_event.is_set():

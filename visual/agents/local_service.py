@@ -46,6 +46,7 @@ class LocalServiceAgent(BaseAgent):
         )
         if service_state and service_state.get("_remote_service"):
             self.state["_remote_service"] = True
+        self.uses_remote_service = bool(self.state.get("_remote_service"))
 
         self._headers = make_local_service_headers(self.state.get("token"))
         self.session_id = None
@@ -87,7 +88,7 @@ class LocalServiceAgent(BaseAgent):
             "task": self.task_instruction,
             "expected_result": self.expected_result,
         }
-        if not self.state.get("_remote_service"):
+        if not self.uses_remote_service:
             payload["client_pid"] = os.getpid()
         if self.requested_model_path:
             payload["requested_model_path"] = self.requested_model_path
