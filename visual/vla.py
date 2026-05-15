@@ -97,6 +97,37 @@ def _open_app(app_name: str):
         print(f"Warning: failed to open app: {e}")
 
 
+def _prepare_local_service_run(
+    model_path: str = None,
+    local_service_host: str = None,
+    local_service_port: int = None,
+    local_service_token: str = None,
+):
+    """Resolve the local inference service endpoint and requested model path."""
+    if local_service_host:
+        if not local_service_token:
+            raise LocalServiceError("--local-service-token is required when --local-service-host is set.")
+        remote_service_state = make_local_service_state(
+            host=local_service_host,
+            port=local_service_port or LOCAL_SERVICE_DEFAULT_PORT,
+            token=local_service_token,
+            use_connect_host=False,
+        )
+        service_state = ensure_local_service_ready(
+            requested_model_path=None,
+            service_state=remote_service_state,
+            require_matching_model_path=False,
+        )
+        return service_state, None
+
+    resolved_path = _resolve_local_model_path(model_path)
+    service_state = ensure_local_service_ready(
+        requested_model_path=resolved_path,
+        require_matching_model_path=True,
+    )
+    return service_state, resolved_path
+
+
 def run_task(task: str, expected_result: str = None, minimize: bool = False,
              max_steps: int = None, local: bool = False, model_path: str = None,
              url: str = None, app: str = None, screenshot_cache_dir: str = None,
@@ -107,29 +138,12 @@ def run_task(task: str, expected_result: str = None, minimize: bool = False,
     from visual.computer.computer_use_util import get_or_create_device_id
 
     if local:
-        from visual.config.user_config import get_config
-        resolved_path = model_path or get_config("default-model-path")
-        if not resolved_path:
-            print("Error: No model path specified. Use --model-path or run:")
-            print("  mano-cua config --set default-model-path ~/path/to/model")
-            return 1
-        resolved_path = os.path.abspath(os.path.expanduser(resolved_path))
-        remote_service_state = None
-        if local_service_host:
-            if not local_service_token:
-                print("Error: --local-service-token is required when --local-service-host is set.")
-                return 1
-            remote_service_state = make_local_service_state(
-                host=local_service_host,
-                port=local_service_port or LOCAL_SERVICE_DEFAULT_PORT,
-                token=local_service_token,
-                use_connect_host=False,
-            )
         try:
-            service_state = ensure_local_service_ready(
-                requested_model_path=resolved_path,
-                service_state=remote_service_state,
-                require_matching_model_path=not bool(remote_service_state),
+            service_state, requested_model_path = _prepare_local_service_run(
+                model_path=model_path,
+                local_service_host=local_service_host,
+                local_service_port=local_service_port,
+                local_service_token=local_service_token,
             )
         except LocalServiceError as exc:
             print(f"Error: {exc}")
@@ -146,7 +160,7 @@ def run_task(task: str, expected_result: str = None, minimize: bool = False,
             agent = LocalServiceAgent(
                 task_instruction=task,
                 expected_result=expected_result,
-                requested_model_path=resolved_path,
+                requested_model_path=requested_model_path,
                 service_state=service_state,
             )
         except Exception as e:
@@ -321,12 +335,16 @@ def _local_service_request(method: str, path: str, payload: dict = None, timeout
     return data
 
 
-def ensure_local_service_ready(requested_model_path: str, service_state: dict = None, require_matching_model_path: bool = True) -> dict:
+def ensure_local_service_ready(requested_model_path: str = None, service_state: dict = None, require_matching_model_path: bool = True) -> dict:
     state = _load_running_local_service_state(service_state=service_state)
-    normalized_requested = os.path.abspath(os.path.expanduser(requested_model_path))
+    normalized_requested = None
+    if requested_model_path:
+        normalized_requested = os.path.abspath(os.path.expanduser(requested_model_path))
 
     data = _local_service_request("GET", "/v1/local/status", timeout=10, service_state=state)
     service_model_path = os.path.abspath(os.path.expanduser(data.get("model_path") or state.get("model_path") or ""))
+    if require_matching_model_path and not normalized_requested:
+        raise LocalServiceError("Requested model path is required to validate the local inference service.")
     if require_matching_model_path and service_model_path != normalized_requested:
         raise LocalServiceError(
             f"Local service is running with model '{service_model_path}'. Stop it and restart with '{normalized_requested}'."

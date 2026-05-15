@@ -22,12 +22,16 @@ class LocalServiceAgent(BaseAgent):
         self,
         task_instruction: str,
         expected_result: Optional[str],
-        requested_model_path: str,
+        requested_model_path: Optional[str],
         service_state: Optional[Dict[str, Any]] = None,
     ):
         self.task_instruction = task_instruction
         self.expected_result = expected_result
-        self.requested_model_path = os.path.abspath(os.path.expanduser(requested_model_path))
+        self.requested_model_path = (
+            os.path.abspath(os.path.expanduser(requested_model_path))
+            if requested_model_path
+            else None
+        )
         self.state = service_state or load_local_service_state()
         if not self.state:
             raise LocalServiceError("Local service is not running. Start it with: mano-cua local start")
@@ -72,16 +76,14 @@ class LocalServiceAgent(BaseAgent):
         return data
 
     def _create_session(self) -> None:
-        data = self._request(
-            "POST",
-            "/v1/local/sessions",
-            {
-                "task": self.task_instruction,
-                "expected_result": self.expected_result,
-                "client_pid": os.getpid(),
-                "requested_model_path": self.requested_model_path,
-            },
-        )
+        payload = {
+            "task": self.task_instruction,
+            "expected_result": self.expected_result,
+            "client_pid": os.getpid(),
+        }
+        if self.requested_model_path:
+            payload["requested_model_path"] = self.requested_model_path
+        data = self._request("POST", "/v1/local/sessions", payload)
         self.session_id = data.get("session_id")
 
     def predict(
