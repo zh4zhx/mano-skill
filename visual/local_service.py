@@ -138,6 +138,16 @@ def describe_local_service_invalid_response(response: Any) -> str:
     return message
 
 
+def describe_local_service_unavailable(host: str, port: int, *, remote: bool = False) -> str:
+    if remote:
+        return (
+            f"Local service at {host}:{port} is unavailable. "
+            "Make sure the remote machine is running `mano-cua local start --host 0.0.0.0`, "
+            "that the host, port, and token are correct, and that the firewall allows incoming connections."
+        )
+    return "Local service is unavailable. Check `mano-cua local status` and restart it with `mano-cua local start`."
+
+
 def request_local_service(
     method: str,
     url: str,

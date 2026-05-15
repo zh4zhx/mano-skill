@@ -8,6 +8,7 @@ from visual.local_service import (
     LocalServiceError,
     build_local_service_url,
     describe_local_service_invalid_response,
+    describe_local_service_unavailable,
     load_local_service_state,
     make_local_service_headers,
     make_local_service_state,
@@ -60,8 +61,10 @@ class LocalServiceAgent(BaseAgent):
                 timeout=600,
             )
         except requests.RequestException as exc:
+            host = self.state.get("connect_host") or self.state.get("host") or "127.0.0.1"
+            port = int(self.state.get("port") or 53111)
             raise LocalServiceError(
-                "Local service is unavailable. Check `mano-cua local status` and restart it with `mano-cua local start`."
+                describe_local_service_unavailable(host, port, remote=self.state.get("host") not in {"127.0.0.1", "::1", "localhost"})
             ) from exc
 
         if response.status_code == 401:

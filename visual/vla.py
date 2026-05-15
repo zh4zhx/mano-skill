@@ -26,6 +26,7 @@ from visual.local_service import (
     LocalInferenceService,
     LocalServiceError,
     build_local_service_url,
+    describe_local_service_unavailable,
     request_local_service,
     delete_local_service_state,
     describe_local_service_invalid_response,
@@ -338,10 +339,7 @@ def _local_service_request(method: str, path: str, payload: dict = None, timeout
         )
     except requests.RequestException as exc:
         if service_state is not None:
-            raise LocalServiceError(
-                f"Local service at {host}:{port} is unavailable. "
-                "Make sure the remote machine is reachable and the service has finished loading the model."
-            ) from exc
+            raise LocalServiceError(describe_local_service_unavailable(host, port, remote=True)) from exc
         raise LocalServiceError("Local service is unavailable. Restart it with: mano-cua local stop && mano-cua local start") from exc
 
     try:
@@ -372,6 +370,14 @@ def ensure_local_service_ready(requested_model_path: str = None, service_state: 
         raise LocalServiceError("Local service is not ready yet. Wait for model loading to finish or restart it.")
     merged = dict(state)
     merged.update(data)
+    if service_state is not None:
+        # Keep using the caller-provided remote endpoint instead of the service's
+        # self-reported bind/local-access addresses, which are only meaningful on
+        # the remote machine itself.
+        merged["host"] = state.get("host")
+        merged["connect_host"] = state.get("connect_host") or state.get("host")
+        merged["port"] = int(state.get("port") or merged.get("port") or LOCAL_SERVICE_DEFAULT_PORT)
+        merged["token"] = state.get("token")
     return merged
 
 
