@@ -121,6 +121,7 @@ def _prepare_local_service_run(
             service_state=remote_service_state,
             require_matching_model_path=False,
         )
+        service_state["_remote_service"] = True
         return service_state, None
 
     resolved_path = _resolve_local_model_path(model_path)
