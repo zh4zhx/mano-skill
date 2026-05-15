@@ -26,6 +26,7 @@ from visual.local_service import (
     LocalInferenceService,
     LocalServiceError,
     build_local_service_url,
+    request_local_service,
     delete_local_service_state,
     describe_local_service_invalid_response,
     generate_local_service_token,
@@ -328,10 +329,10 @@ def _local_service_request(method: str, path: str, payload: dict = None, timeout
     port = int(state.get("port") or LOCAL_SERVICE_DEFAULT_PORT)
 
     try:
-        response = requests.request(
+        response = request_local_service(
             method=method,
             url=url,
-            json=payload or {},
+            payload=payload,
             headers=headers,
             timeout=timeout,
         )

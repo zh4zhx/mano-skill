@@ -136,6 +136,25 @@ def describe_local_service_invalid_response(response: Any) -> str:
     return message
 
 
+def request_local_service(
+    method: str,
+    url: str,
+    *,
+    payload: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = 30,
+):
+    return requests.request(
+        method=method,
+        url=url,
+        json=payload or {},
+        headers=headers or {},
+        timeout=timeout,
+        proxies={"http": None, "https": None},
+        trust_env=False,
+    )
+
+
 def _normalize_model_path(model_path: str) -> str:
     return os.path.abspath(os.path.expanduser(model_path))
 

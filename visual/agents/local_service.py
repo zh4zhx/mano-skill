@@ -11,6 +11,7 @@ from visual.local_service import (
     load_local_service_state,
     make_local_service_headers,
     make_local_service_state,
+    request_local_service,
 )
 
 
@@ -51,10 +52,10 @@ class LocalServiceAgent(BaseAgent):
     def _request(self, method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = build_local_service_url(path, self.state)
         try:
-            response = requests.request(
+            response = request_local_service(
                 method=method,
                 url=url,
-                json=payload or {},
+                payload=payload,
                 headers=self._headers,
                 timeout=600,
             )
