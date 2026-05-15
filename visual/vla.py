@@ -41,8 +41,47 @@ from visual.local_service import (
 )
 
 
-def stop_session():
+def stop_session(local: bool = False, local_service_host: str = None,
+                 local_service_port: int = None, local_service_token: str = None):
     """Stop the current active session for this device"""
+    if local_service_host:
+        if not local:
+            print("Error: --local-service-host can only be used with stop --local.")
+            return 1
+        if not local_service_token:
+            print("Error: --local-service-token is required when --local-service-host is set.")
+            return 1
+        service_state = make_local_service_state(
+            host=local_service_host,
+            port=local_service_port or LOCAL_SERVICE_DEFAULT_PORT,
+            token=local_service_token,
+            use_connect_host=False,
+        )
+        try:
+            status = _local_service_request("GET", "/v1/local/status", timeout=10, service_state=service_state)
+        except LocalServiceError as exc:
+            print(f"Failed to query remote local service: {exc}")
+            return 1
+
+        session_id = status.get("active_session")
+        if not session_id:
+            print("Remote local service has no active session.")
+            return 0
+
+        try:
+            _local_service_request("POST", f"/v1/local/sessions/{session_id}/stop", {}, timeout=10, service_state=service_state)
+        except LocalServiceError:
+            pass
+
+        try:
+            _local_service_request("POST", f"/v1/local/sessions/{session_id}/close", {}, timeout=10, service_state=service_state)
+        except LocalServiceError as exc:
+            print(f"Failed to close remote local session {session_id}: {exc}")
+            return 1
+
+        print(f"Remote local session cleared: {session_id}")
+        return 0
+
     from visual.config.visual_config import BASE_URL
     from visual.computer.computer_use_util import get_or_create_device_id
 
@@ -749,7 +788,11 @@ def main():
     run_parser.add_argument("--app", help="Open app before starting task (use macOS app name, e.g. 'Notes', 'Safari', 'Google Chrome')", default=None)
 
     # --- stop ---
-    subparsers.add_parser("stop", help="Stop the current running task")
+    stop_parser = subparsers.add_parser("stop", help="Stop the current running task")
+    stop_parser.add_argument("--local", help="Stop a local-service-backed task", action="store_true", default=False)
+    stop_parser.add_argument("--local-service-host", help="Remote local inference service host for stop --local", default=None)
+    stop_parser.add_argument("--local-service-port", help=f"Remote local inference service port (default: {LOCAL_SERVICE_DEFAULT_PORT})", type=int, default=LOCAL_SERVICE_DEFAULT_PORT)
+    stop_parser.add_argument("--local-service-token", help="Remote local inference service token for stop --local", default=None)
 
     # --- local service management ---
     local_parser = subparsers.add_parser("local", help="Manage the persistent local inference service")
@@ -793,7 +836,12 @@ def main():
         open(flag, "w").close()
         print("Stop signal sent. Local task will stop after current step completes.")
         # Also attempt cloud session stop
-        ret = stop_session()
+        ret = stop_session(
+            local=getattr(args, "local", False),
+            local_service_host=getattr(args, "local_service_host", None),
+            local_service_port=getattr(args, "local_service_port", LOCAL_SERVICE_DEFAULT_PORT),
+            local_service_token=getattr(args, "local_service_token", None),
+        )
         return ret
 
     if args.command == "local":
