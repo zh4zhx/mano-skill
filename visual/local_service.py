@@ -14,6 +14,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+import requests
+
 LOCAL_SERVICE_HOST = "127.0.0.1"
 LOCAL_SERVICE_DEFAULT_PORT = 53111
 LOCAL_SERVICE_TOKEN_HEADER = "X-Mano-Local-Token"
@@ -144,15 +146,19 @@ def request_local_service(
     headers: Optional[Dict[str, str]] = None,
     timeout: int = 30,
 ):
-    return requests.request(
-        method=method,
-        url=url,
-        json=payload or {},
-        headers=headers or {},
-        timeout=timeout,
-        proxies={"http": None, "https": None},
-        trust_env=False,
-    )
+    session = requests.Session()
+    session.trust_env = False
+    try:
+        return session.request(
+            method=method,
+            url=url,
+            json=payload or {},
+            headers=headers or {},
+            timeout=timeout,
+            proxies={"http": None, "https": None},
+        )
+    finally:
+        session.close()
 
 
 def _normalize_model_path(model_path: str) -> str:
