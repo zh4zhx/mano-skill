@@ -298,6 +298,16 @@ def _load_running_local_service_state(service_state: dict = None) -> dict:
     pid = state.get("pid")
     host = state.get("connect_host") or get_local_service_connect_host(state.get("host"))
     port = int(state.get("port") or LOCAL_SERVICE_DEFAULT_PORT)
+    explicit_service_target = service_state is not None
+
+    if explicit_service_target:
+        if not is_port_listening(host, port):
+            raise LocalServiceError(
+                f"Local service at {host}:{port} is not reachable. "
+                "Make sure the remote machine is running `mano-cua local start --host 0.0.0.0` "
+                "and that the host, port, and token are correct."
+            )
+        return state
 
     if pid and not is_pid_alive(pid):
         delete_local_service_state()
@@ -313,6 +323,8 @@ def _local_service_request(method: str, path: str, payload: dict = None, timeout
     state = _load_running_local_service_state(service_state=service_state)
     headers = make_local_service_headers(state.get("token"))
     url = build_local_service_url(path, state)
+    host = state.get("connect_host") or get_local_service_connect_host(state.get("host"))
+    port = int(state.get("port") or LOCAL_SERVICE_DEFAULT_PORT)
 
     try:
         response = requests.request(
@@ -323,6 +335,11 @@ def _local_service_request(method: str, path: str, payload: dict = None, timeout
             timeout=timeout,
         )
     except requests.RequestException as exc:
+        if service_state is not None:
+            raise LocalServiceError(
+                f"Local service at {host}:{port} is unavailable. "
+                "Make sure the remote machine is reachable and the service has finished loading the model."
+            ) from exc
         raise LocalServiceError("Local service is unavailable. Restart it with: mano-cua local stop && mano-cua local start") from exc
 
     try:
