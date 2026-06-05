@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import platform
+import sys
 import threading
 import time
 import uuid
@@ -17,7 +18,8 @@ from visual.config.visual_config import AUTOMATION_CONFIG, TASK_STATUS
 from visual.model.task_progress import TaskProgress
 from visual.model.task_state import TaskState
 from visual.computer.computer_use_util import screenshot_to_bytes, get_or_create_device_id, \
-    make_tool_result, current_timestamp_iso, ensure_directory, sanitize_filename_suffix, write_index_json, write_png
+    make_tool_result, current_timestamp_iso, ensure_directory, sanitize_filename_suffix, write_index_json, write_png, \
+    make_tool_result, strip_tool_results
 
 
 class TaskModel:
@@ -99,16 +101,20 @@ class TaskModel:
                 os.path.expanduser("~/.mano/trajectory"), self._session_id
             )
             os.makedirs(os.path.join(self._trajectory_dir, "screenshots"), exist_ok=True)
-            # Save task metadata
-            with open(os.path.join(self._trajectory_dir, "task.json"), "w", encoding="utf-8") as f:
-                json.dump({
-                    "task": task_name,
-                    "expected_result": expected_result,
-                    "agent_type": agent.agent_type,
-                    "max_steps": max_steps,
-                    "session_id": self._session_id,
-                    "timestamp": ts,
-                }, f, indent=2, ensure_ascii=False)
+            # Save session metadata (updated with result on completion)
+            self._session_meta = {
+                "task": task_name,
+                "expected_result": expected_result,
+                "agent_type": agent.agent_type,
+                "max_steps": max_steps,
+                "session_id": self._session_id,
+                "started_at": ts,
+                "cli": " ".join(sys.argv),
+                "platform": platform.system(),
+                "arch": platform.machine(),
+                "os_version": platform.mac_ver()[0] or platform.version(),
+            }
+            self._save_session_meta()
             print(f"Trajectory: {self._trajectory_dir}")
 
         # Initialize executor
@@ -469,8 +475,12 @@ class TaskModel:
 
             # 5. Handle terminal status
             if status == "DONE":
+                if self._save_trajectory and self._trajectory_dir:
+                    self._save_step_trajectory(step_idx + 1, reasoning, actions, action_desc, tool_results)
                 break
             elif status == "FAIL":
+                if self._save_trajectory and self._trajectory_dir:
+                    self._save_step_trajectory(step_idx + 1, reasoning, actions, action_desc, tool_results)
                 self.mark_error("Agent marked task as failed")
                 break
             elif status == "MAX_STEP_REACHED":
@@ -536,7 +546,7 @@ class TaskModel:
 
     # ========== Trajectory Saving ==========
     def _save_step_trajectory(self, step_idx, reasoning, actions, action_desc, tool_results):
-        """Save screenshot + action metadata for one step."""
+        """Save screenshot + action metadata + tool results for one step."""
         try:
             for tr in reversed(tool_results or []):
                 b64 = tr.get("screenshot_b64")
@@ -552,7 +562,9 @@ class TaskModel:
                 "reasoning": reasoning,
                 "action_desc": action_desc,
                 "actions": [{"name": a.get("name"), "input": a.get("input"), "action_type": a.get("action_type")} for a in actions],
+                "tool_results": strip_tool_results(tool_results),
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "raw_response": getattr(self.agent, "last_raw_response", None),
             }
             history_path = os.path.join(self._trajectory_dir, "history.jsonl")
             with open(history_path, "a", encoding="utf-8") as f:
@@ -571,16 +583,17 @@ class TaskModel:
                 with open(path, "wb") as f:
                     f.write(final_shot)
 
-            result = {
-                "task": self.state.task_name,
+            # Update session metadata with result
+            self._session_meta.update({
                 "status": self.state.status,
                 "total_steps": self.state.progress.step_idx,
-                "agent_type": self.agent.agent_type if self.agent else None,
-                "session_id": self._session_id,
                 "error_msg": self.state.error_msg,
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            }
-            with open(os.path.join(self._trajectory_dir, "result.json"), "w", encoding="utf-8") as f:
-                json.dump(result, f, indent=2, ensure_ascii=False)
+                "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            })
+            self._save_session_meta()
         except Exception as e:
             print(f"Warning: failed to save final trajectory: {e}")
+
+    def _save_session_meta(self):
+        with open(os.path.join(self._trajectory_dir, "session.json"), "w", encoding="utf-8") as f:
+            json.dump(self._session_meta, f, indent=2, ensure_ascii=False)

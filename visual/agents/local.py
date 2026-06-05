@@ -178,6 +178,8 @@ finish() # The task is completed.
         if deterministic:
             think, action_desp, action = deterministic
             parsed_actions = [action]
+            response_text = None
+            self.last_raw_response = None
         else:
             # 2. Build prompt
             user_text, images = self._build_prompt(task_instruction, screenshot_b64)
@@ -186,8 +188,11 @@ finish() # The task is completed.
             response_text = self._infer(user_text, images)
             print(f"  [model output] {response_text}")
 
-            # 4. Parse response
+            # Save raw response to file
             self._save_raw_response(response_text)
+            self.last_raw_response = response_text
+
+            # 4. Parse response
             parsed = self._parse_response(response_text)
             think = parsed["think"]
             action_desp = parsed["action_desp"]
@@ -616,7 +621,13 @@ finish() # The task is completed.
 
     def _extract_tag(self, text: str, tag: str) -> Optional[str]:
         m = re.search(rf"<{tag}>(.*?)</{tag}>", text, re.DOTALL)
-        return m.group(1) if m else None
+        if m:
+            return m.group(1)
+        # Thinking mode: content before </think> without opening <think> tag
+        if tag == "think":
+            m = re.search(r"^(.*?)</think>", text, re.DOTALL)
+            return m.group(1) if m else None
+        return None
 
     def _parse_box(self, box_str: str) -> list:
         m = re.search(r"\((\d+)\s*,\s*(\d+)\)", box_str)
