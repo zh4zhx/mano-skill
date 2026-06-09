@@ -106,7 +106,9 @@ def _normalize_key_token(k, is_macos):
     k = k.replace("-", "_").replace(" ", "_")
 
     # "command" / "cmd" — macOS Cmd, Windows uses Ctrl as Cmd-equivalent.
-    if k in ("command", "cmd"):
+    # Accept common typos emitted by users/models so macOS shortcuts do not
+    # silently become Ctrl-based fallbacks.
+    if k in ("command", "cmd", "commad", "comand", "comamnd"):
         return "cmd" if is_macos else "ctrl"
     # "win" / "meta" / "super" — these refer to the Windows / Super key on
     # Linux/Windows, which pynput exposes as Key.cmd. On macOS we still want

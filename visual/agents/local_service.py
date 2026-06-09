@@ -1,4 +1,5 @@
 import os
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -104,7 +105,10 @@ class LocalServiceAgent(BaseAgent):
         data = self._request(
             "POST",
             f"/v1/local/sessions/{self.session_id}/step",
-            {"tool_results": tool_results or []},
+            {
+                "request_id": str(uuid.uuid4()),
+                "tool_results": tool_results or [],
+            },
         )
         return (
             data.get("reasoning", ""),

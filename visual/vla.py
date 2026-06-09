@@ -66,45 +66,72 @@ from visual.local_service import (
 
 
 def stop_session(local: bool = False, local_service_host: str = None,
-                 local_service_port: int = None, local_service_token: str = None):
-    """Stop the current active session for this device"""
-    if local_service_host:
-        if not local:
-            print("Error: --local-service-host can only be used with stop --local.")
-            return 1
+                 local_service_port: int = None, local_service_token: str = None,
+                 session_id: str = None):
+    """Stop local-service sessions or the current cloud task."""
+    if local:
         if not local_service_token:
+            local_service_token = None
+        if local_service_host and not local_service_token:
             print("Error: --local-service-token is required when --local-service-host is set.")
             return 1
-        service_state = make_local_service_state(
-            host=local_service_host,
-            port=local_service_port or LOCAL_SERVICE_DEFAULT_PORT,
-            token=local_service_token,
-            use_connect_host=False,
-        )
+        service_state = None
+        if local_service_host:
+            service_state = make_local_service_state(
+                host=local_service_host,
+                port=local_service_port or LOCAL_SERVICE_DEFAULT_PORT,
+                token=local_service_token,
+                use_connect_host=False,
+            )
         try:
             status = _local_service_request("GET", "/v1/local/status", timeout=10, service_state=service_state)
         except LocalServiceError as exc:
-            print(f"Failed to query remote local service: {exc}")
+            print(f"Failed to query local service: {exc}")
             return 1
 
-        session_id = status.get("active_session")
-        if not session_id:
-            print("Remote local service has no active session.")
+        sessions = status.get("sessions") or []
+        if session_id:
+            target_ids = [session_id]
+        else:
+            target_ids = [session.get("session_id") for session in sessions if session.get("session_id")]
+            if not target_ids and status.get("active_session"):
+                target_ids = [status.get("active_session")]
+
+        if not target_ids:
+            print("Local service has no active sessions.")
             return 0
 
-        try:
-            _local_service_request("POST", f"/v1/local/sessions/{session_id}/stop", {}, timeout=10, service_state=service_state)
-        except LocalServiceError:
-            pass
+        failures = []
+        cleared = []
+        for target_id in target_ids:
+            try:
+                _local_service_request("POST", f"/v1/local/sessions/{target_id}/stop", {}, timeout=10, service_state=service_state)
+            except LocalServiceError:
+                pass
 
-        try:
-            _local_service_request("POST", f"/v1/local/sessions/{session_id}/close", {}, timeout=10, service_state=service_state)
-        except LocalServiceError as exc:
-            print(f"Failed to close remote local session {session_id}: {exc}")
+            try:
+                _local_service_request("POST", f"/v1/local/sessions/{target_id}/close", {}, timeout=10, service_state=service_state)
+            except LocalServiceError as exc:
+                failures.append((target_id, exc))
+            else:
+                cleared.append(target_id)
+
+        for target_id, exc in failures:
+            print(f"Failed to close local session {target_id}: {exc}")
+        if failures:
             return 1
-
-        print(f"Remote local session cleared: {session_id}")
+        if len(cleared) == 1:
+            print(f"Local session cleared: {cleared[0]}")
+        else:
+            print(f"Local sessions cleared: {len(cleared)}")
         return 0
+
+    if local_service_host:
+        print("Error: --local-service-host can only be used with stop --local.")
+        return 1
+    if session_id:
+        print("Error: --session-id can only be used with stop --local.")
+        return 1
 
     from visual.config.visual_config import BASE_URL
     from visual.computer.computer_use_util import get_or_create_device_id
@@ -128,7 +155,6 @@ def stop_session(local: bool = False, local_service_host: str = None,
     except Exception as e:
         print(f"Failed to stop session: {e}")
         return 1
-
 
 def _open_url_in_browser(url: str):
     """Open a URL in the default browser (cross-platform)."""
@@ -791,7 +817,22 @@ def cmd_local_status(args):
     print(f"PID: {data.get('pid')}")
     print(f"Model: {data.get('model_path')}")
     print(f"Started at: {data.get('started_at')}")
-    if data.get("active_session"):
+    sessions = data.get("sessions") or []
+    if sessions:
+        print(f"Active sessions: {len(sessions)}/{data.get('max_sessions') or '?'}")
+        for session in sessions:
+            pid_label = session.get("client_pid") if session.get("client_pid") is not None else "-"
+            print(
+                f"  - {session.get('session_id')} "
+                f"state={session.get('state')} "
+                f"pid={pid_label} "
+                f"pending={session.get('pending_steps', 0)} "
+                f"in_flight={session.get('in_flight', False)}"
+            )
+            task = session.get("task")
+            if task:
+                print(f"    task: {task}")
+    elif data.get("active_session"):
         print(f"Active session: {data.get('active_session')} (client pid: {data.get('client_pid')})")
     if data.get("cleanup"):
         print(f"Cleanup: {data.get('cleanup')}")
@@ -1022,6 +1063,7 @@ def main():
     stop_parser.add_argument("--local-service-host", help="Remote local inference service host for stop --local", default=None)
     stop_parser.add_argument("--local-service-port", help=f"Remote local inference service port (default: {LOCAL_SERVICE_DEFAULT_PORT})", type=int, default=LOCAL_SERVICE_DEFAULT_PORT)
     stop_parser.add_argument("--local-service-token", help="Remote local inference service token for stop --local", default=None)
+    stop_parser.add_argument("--session-id", help="Stop a specific local service session (with --local)", default=None)
 
     # --- local service management ---
     local_parser = subparsers.add_parser("local", help="Manage the persistent local inference service")
@@ -1070,6 +1112,7 @@ def main():
             local_service_host=getattr(args, "local_service_host", None),
             local_service_port=getattr(args, "local_service_port", LOCAL_SERVICE_DEFAULT_PORT),
             local_service_token=getattr(args, "local_service_token", None),
+            session_id=getattr(args, "session_id", None),
         )
         return ret
 

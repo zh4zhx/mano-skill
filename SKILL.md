@@ -134,6 +134,8 @@ mano-cua local start
 mano-cua local start --host 0.0.0.0
 ```
 
+本地后台服务可以同时维护多个 active session，但模型只加载一次；各会话保留独立上下文，推理请求通过同一个本地 worker 串行执行。`mano-cua local status` 会显示当前所有 active sessions、任务文本和排队状态。
+
 ### `--model-path`
 
 覆盖默认本地模型路径，通常和 `--local` 搭配使用。
@@ -186,9 +188,22 @@ mano-cua run --local \
 mano-cua local status
 mano-cua local stop
 
-# 停止当前任务
+# 停止当前云端任务
 mano-cua stop
+
+# 停止本机本地服务上的所有 active sessions
+mano-cua stop --local
+
+# 只停止某个本地会话
+mano-cua stop --local --session-id local-abc123
+
+# 停止远端本地服务上的所有 active sessions
+mano-cua stop --local \
+  --local-service-host 192.168.1.20 \
+  --local-service-token my-passphrase
 ```
+
+`mano-cua local stop` 只负责关闭后台服务；如果仍有 active sessions，它会拒绝关闭并提示先执行 `mano-cua stop --local`。
 
 ## `mac_silent_install.py` 使用说明
 

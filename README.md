@@ -70,6 +70,12 @@ mano-cua local start --host 0.0.0.0
 mano-cua local status
 mano-cua local stop
 
+# Stop all active sessions on the local inference service
+mano-cua stop --local
+
+# Stop one local-service session
+mano-cua stop --local --session-id local-abc123
+
 # Run in local mode (on-device inference, macOS Apple Silicon only)
 mano-cua run --local "task"
 
@@ -134,14 +140,19 @@ mano-cua run --screenshot-cache-dir /tmp/mano-cua-cache "Open System Settings an
 mano-cua run "Open WeChat and tell FTY that the meeting is postponed"
 mano-cua run "Search for AI news in Xiaohongshu and show the first post"
 
-# Stop the current task
+# Stop the current cloud task
 mano-cua stop
+
+# Stop all local-service-backed tasks
+mano-cua stop --local
 
 # Stop the persistent local inference service
 mano-cua local stop
 ```
 
 `run --local` now requires the local inference service to be running first. If it is not running, the CLI will ask you to start it with `mano-cua local start`.
+
+The persistent local service can hold multiple active sessions at once while loading the model only once. Inference steps are processed through one local worker, so session context is isolated without starting multiple model copies. `mano-cua local status` lists active sessions with their task text, state, client pid, and pending step count.
 
 To expose the service to other devices on your local network, start it with `mano-cua local start --host 0.0.0.0`. The CLI keeps local requests on `127.0.0.1`, and `mano-cua local status` will show both the bind host and the local access address.
 
@@ -150,6 +161,8 @@ To expose the service with your own memorable passphrase instead of a generated 
 Requests from the same machine over `127.0.0.1` or `::1` do not need a token. Requests from other devices on the LAN still require the configured token/passphrase.
 
 To run automation on one machine while using a model service hosted on another machine in the same LAN, use `run --local` with `--local-service-host`, optional `--local-service-port`, and `--local-service-token`. The value passed to `--local-service-token` can be either the generated token or your custom passphrase. The remote host should be the LAN IP of the machine running `mano-cua local start --host 0.0.0.0`.
+
+To clear sessions on a remote local service, run `mano-cua stop --local --local-service-host HOST --local-service-token TOKEN`. Add `--session-id local-...` to stop only one session. `mano-cua local stop` stops the background service itself and refuses to shut down while sessions are active; clear sessions first with `mano-cua stop --local`.
 
 ## Supported Actions
 

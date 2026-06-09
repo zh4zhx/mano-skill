@@ -8,6 +8,7 @@ import platform
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image
@@ -25,6 +26,62 @@ LOCAL_AGENT_CONFIG = {
     "HISTORY_IMAGE_COUNT": 0,
     "STEP_MEMORY_COUNT": 4,
 }
+
+
+@dataclass
+class LocalModelRuntime:
+    """Shared local model runtime; task/session state stays in LocalAgent."""
+
+    model_path: str
+    model: Any = None
+    processor: Any = None
+    custom_generate: Any = None
+    loaded: bool = False
+
+    def __post_init__(self) -> None:
+        self.model_path = os.path.expanduser(self.model_path)
+        self.model_name = os.path.basename(self.model_path)
+
+    def ensure_loaded(self) -> None:
+        """Load model weights once for the whole local service."""
+        if self.loaded:
+            return
+        import mlx_vlm as pm
+        from vlm_service import custom_generate
+
+        logger.info(f"Loading local model from {self.model_path} ...")
+        self.model, self.processor = pm.load(self.model_path)
+
+        # W8A8 acceleration (config: auto/on/off, default auto)
+        from visual.config.user_config import get_config
+        w8a8_mode = get_config("w8a8") or "auto"
+        if w8a8_mode != "off":
+            try:
+                import mlx.core as mx
+                from cider import convert_model, is_available
+                if w8a8_mode == "auto" and not is_available():
+                    logger.info("W8A8 not available on this hardware (requires M5+)")
+                elif w8a8_mode == "on" or is_available():
+                    try:
+                        stats = convert_model(self.model.language_model)
+                    except Exception:
+                        stats = convert_model(self.model)
+                    # Pre-warm: quantize all INT8 weights upfront
+                    from cider.nn import CiderLinear
+                    for module in self.model.language_model.modules():
+                        if isinstance(module, CiderLinear):
+                            module._ensure_w8()
+                    mx.eval(self.model.parameters())
+                    logger.info(f"W8A8 enabled: {stats}")
+            except ImportError:
+                if w8a8_mode == "on":
+                    logger.warning("W8A8 requested but cider not installed")
+            except Exception as e:
+                logger.warning(f"W8A8 init failed: {e}")
+
+        self.custom_generate = custom_generate
+        self.loaded = True
+        logger.info("Local model loaded successfully.")
 
 
 class LocalAgent(BaseAgent):
@@ -62,6 +119,7 @@ finish() # The task is completed.
 
 ## Note
 - Use Chinese in `<think>` part.
+- Current platform is {platform}. On macOS, command/cmd shortcuts must use the macOS Command key (`cmd`). Never replace command/cmd with `ctrl`.
 - Write a small plan and finally summarize your next action (with its target element) in one sentence in `<action_desp>` part.
 - If the user explicitly requests a keyboard shortcut such as command/cmd/ctrl/shift/alt + key, use `hotkey(key='...')` first unless the screenshot clearly shows that the shortcut has already been used or failed.
 - For `type(content='...')`, the content must be the exact literal text to input. Preserve Chinese characters, English letters, numbers, spaces, and punctuation exactly as requested. Never transliterate to pinyin, never paraphrase, and never substitute with similar words.
@@ -78,15 +136,23 @@ finish() # The task is completed.
 
 """
 
-    def __init__(self, model_path: str):
-        self._model_path = os.path.expanduser(model_path)
-        self.model_name = os.path.basename(self._model_path)
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        *,
+        runtime: Optional[LocalModelRuntime] = None,
+        session_id: Optional[str] = None,
+    ):
+        if runtime is None:
+            if not model_path:
+                raise ValueError("model_path is required when runtime is not provided")
+            runtime = LocalModelRuntime(model_path=model_path)
+        self.runtime = runtime
+        self._model_path = self.runtime.model_path
+        self.model_name = self.runtime.model_name
+        self.session_id = session_id
         self.cfg = LOCAL_AGENT_CONFIG
 
-        self.model = None
-        self.processor = None
-        self._custom_generate = None
-        self._model_loaded = False
         self._current_task_instruction = ""
         self._current_expected_result = None
         self._planned_task_key = None
@@ -96,47 +162,11 @@ finish() # The task is completed.
 
         self.prompt_history: list = []
         self.step_count = 0
+        self.last_raw_response = None
 
     def _ensure_model_loaded(self):
         """Lazy-load model on first predict (must be called from worker thread)."""
-        if self._model_loaded:
-            return
-        import mlx_vlm as pm
-        from vlm_service import custom_generate
-
-        logger.info(f"Loading local model from {self._model_path} ...")
-        self.model, self.processor = pm.load(self._model_path)
-
-        # W8A8 acceleration (config: auto/on/off, default auto)
-        from visual.config.user_config import get_config
-        w8a8_mode = get_config("w8a8") or "auto"
-        if w8a8_mode != "off":
-            try:
-                import mlx.core as mx
-                from cider import convert_model, is_available
-                if w8a8_mode == "auto" and not is_available():
-                    logger.info("W8A8 not available on this hardware (requires M5+)")
-                elif w8a8_mode == "on" or is_available():
-                    try:
-                        stats = convert_model(self.model.language_model)
-                    except Exception:
-                        stats = convert_model(self.model)
-                    # Pre-warm: quantize all INT8 weights upfront
-                    from cider.nn import CiderLinear
-                    for module in self.model.language_model.modules():
-                        if isinstance(module, CiderLinear):
-                            module._ensure_w8()
-                    mx.eval(self.model.parameters())
-                    logger.info(f"W8A8 enabled: {stats}")
-            except ImportError:
-                if w8a8_mode == "on":
-                    logger.warning("W8A8 requested but cider not installed")
-            except Exception as e:
-                logger.warning(f"W8A8 init failed: {e}")
-
-        self._custom_generate = custom_generate
-        self._model_loaded = True
-        logger.info("Local model loaded successfully.")
+        self.runtime.ensure_loaded()
 
     def preload_model(self) -> None:
         """Eagerly load the local model for background-service startup."""
@@ -152,6 +182,7 @@ finish() # The task is completed.
         self._last_processed_tool_result_id = None
         self.prompt_history = []
         self.step_count = 0
+        self.last_raw_response = None
 
     # ─── BaseAgent interface ──────────────────────────────────
 
@@ -207,6 +238,7 @@ finish() # The task is completed.
                 "actions": parsed_actions,
                 "screenshot_b64": screenshot_b64,
             })
+            self._trim_prompt_history()
 
         # 6. Convert to Claude-compatible actions and determine status
         if not parsed_actions:
@@ -234,8 +266,11 @@ finish() # The task is completed.
         import json
         log_path = os.path.expanduser("~/.mano/raw_responses.jsonl")
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        payload = {"step": self.step_count, "raw": text}
+        if self.session_id:
+            payload["session_id"] = self.session_id
         with open(log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"step": self.step_count, "raw": text}, ensure_ascii=False) + "\n")
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     def agree_to_continue(self) -> None:
         self.prompt_history.append({
@@ -243,6 +278,12 @@ finish() # The task is completed.
             "action": {"action": "continue"},
             "screenshot_b64": "",
         })
+        self._trim_prompt_history()
+
+    def _trim_prompt_history(self) -> None:
+        max_entries = max(1, int(self.cfg.get("STEP_MEMORY_COUNT") or 4))
+        if len(self.prompt_history) > max_entries:
+            self.prompt_history = self.prompt_history[-max_entries:]
 
     def _ensure_stage_plan(self) -> None:
         task_key = (self._current_task_instruction or "", self._current_expected_result or "")
@@ -326,7 +367,7 @@ finish() # The task is completed.
     def _infer_stage_hint(self, clause: str) -> str:
         if "双击" in clause:
             return "doubleclick"
-        if any(k in clause.lower() for k in ("cmd+", "command+", "ctrl+", "alt+", "shift+")) or "键盘输入" in clause or "快捷键" in clause:
+        if any(k in clause.lower() for k in ("cmd+", "command+", "commad+", "comand+", "comamnd+", "ctrl+", "alt+", "shift+")) or "键盘输入" in clause or "快捷键" in clause:
             return "hotkey"
         if "调整" in clause or "滑杆" in clause or "拖动" in clause:
             return "drag"
@@ -393,8 +434,7 @@ finish() # The task is completed.
 
     def _extract_shortcut_from_text(self, text: str) -> Optional[str]:
         patterns = [
-            r"(cmd\s*\+\s*[A-Za-z0-9])",
-            r"(command\s*\+\s*[A-Za-z0-9])",
+            r"((?:cmd|command|commad|comand|comamnd)\s*\+\s*[A-Za-z0-9])",
             r"(ctrl\s*\+\s*[A-Za-z0-9])",
             r"(alt\s*\+\s*[A-Za-z0-9])",
             r"(shift\s*\+\s*[A-Za-z0-9])",
@@ -402,7 +442,8 @@ finish() # The task is completed.
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
-                return re.sub(r"\s+", "", match.group(1))
+                shortcut = re.sub(r"\s+", "", match.group(1))
+                return re.sub(r"^(?:command|commad|comand|comamnd)\+", "cmd+", shortcut, flags=re.IGNORECASE)
         return None
 
     def _extract_literal_text_from_stage(self, text: str) -> Optional[str]:
@@ -575,7 +616,7 @@ finish() # The task is completed.
             img_bytes = base64.b64decode(b64)
             pil_images.append(Image.open(io.BytesIO(img_bytes)))
 
-        prompt = self.processor.tokenizer.apply_chat_template(
+        prompt = self.runtime.processor.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
         # Replace <image> placeholders with Qwen3-VL vision tokens
@@ -590,8 +631,8 @@ finish() # The task is completed.
             else:
                 break
 
-        result = self._custom_generate(
-            self.model, self.processor, prompt,
+        result = self.runtime.custom_generate(
+            self.runtime.model, self.runtime.processor, prompt,
             pil_images if pil_images else None,
             max_tokens=self.cfg["MAX_NEW_TOKENS"],
             temperature=self.cfg["TEMPERATURE"],
@@ -643,6 +684,9 @@ finish() # The task is completed.
         alias_map = {
             "cmd": "cmd",
             "command": "cmd",
+            "commad": "cmd",
+            "comand": "cmd",
+            "comamnd": "cmd",
             "meta": "cmd",
             "win": "cmd",
             "super": "cmd",
@@ -679,6 +723,35 @@ finish() # The task is completed.
                 mains.append(key_name)
 
         return modifiers, mains
+
+    def _repair_hotkey_key_for_task(self, key_spec: str) -> str:
+        """Keep explicit macOS Command shortcuts from being emitted as Ctrl."""
+        key_text = str(key_spec or "")
+        if platform.system() != "Darwin":
+            return key_text
+
+        modifiers, mains = self._parse_hotkey_spec(key_text)
+        if "ctrl" not in modifiers or "cmd" in modifiers or len(mains) != 1:
+            return key_text
+
+        task_text = " ".join(
+            part for part in (
+                self._current_task_instruction,
+                self._current_expected_result or "",
+                (self._get_current_stage() or {}).get("text", ""),
+            )
+            if part
+        )
+        if not task_text:
+            return key_text
+
+        main = re.escape(mains[0])
+        key_end = r"(?=$|[^A-Za-z0-9_])"
+        command_pattern = rf"(?<![A-Za-z0-9_])(?:cmd|command|commad|comand|comamnd)\s*\+\s*{main}{key_end}"
+        ctrl_pattern = rf"(?<![A-Za-z0-9_])(?:ctrl|control)\s*\+\s*{main}{key_end}"
+        if re.search(command_pattern, task_text, re.IGNORECASE) and not re.search(ctrl_pattern, task_text, re.IGNORECASE):
+            return "cmd+" + mains[0]
+        return key_text
 
     def _parse_action(self, action_str: str) -> Optional[dict]:
         action_str = action_str.strip()
@@ -913,7 +986,8 @@ finish() # The task is completed.
 
         if act == "hotkey_click":
             coords = action.get("coords", [0, 0])
-            modifiers, _ = self._parse_hotkey_spec(action.get("key", ""))
+            key = self._repair_hotkey_key_for_task(action.get("key", ""))
+            modifiers, _ = self._parse_hotkey_spec(key)
             return [self._make_tool_action({
                 "action": "left_click",
                 "coordinate": self._norm_coord(coords[0], coords[1]),
@@ -927,7 +1001,8 @@ finish() # The task is completed.
             })]
 
         if act == "hotkey":
-            modifiers, mains = self._parse_hotkey_spec(action.get("key", ""))
+            key = self._repair_hotkey_key_for_task(action.get("key", ""))
+            modifiers, mains = self._parse_hotkey_spec(key)
             return [self._make_tool_action({
                 "action": "key",
                 "modifiers": modifiers,
